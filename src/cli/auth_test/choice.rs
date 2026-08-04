@@ -25,6 +25,22 @@ pub(crate) async fn auth_test_choice_plan(
         });
     }
 
+    if let Some(named_profile) = active_named_openai_compatible_auth_test_profile(choice)? {
+        if named_profile.default_model.is_some() {
+            return Ok(AuthTestChoicePlan::Run { model: None });
+        }
+
+        let discovered_model = discover_openai_compatible_validation_model(&named_profile).await?;
+        if let Some(model) = discovered_model {
+            return Ok(AuthTestChoicePlan::Run { model: Some(model) });
+        }
+
+        return Ok(AuthTestChoicePlan::Skip(format!(
+            "Skipped: {} local endpoint reported no models. Re-run `jcode auth-test --provider-profile {} --model <local-model>` or set a default model first.",
+            named_profile.display_name, named_profile.id
+        )));
+    }
+
     let Some(profile) = super::provider_init::profile_for_choice(choice) else {
         return Ok(AuthTestChoicePlan::Run { model: None });
     };
@@ -44,6 +60,77 @@ pub(crate) async fn auth_test_choice_plan(
         resolved.display_name,
         choice.as_arg_value()
     )))
+}
+
+fn active_named_openai_compatible_auth_test_profile(
+    choice: &super::provider_init::ProviderChoice,
+) -> Result<Option<crate::provider_catalog::ResolvedOpenAiCompatibleProfile>> {
+    if !matches!(
+        choice,
+        super::provider_init::ProviderChoice::OpenaiCompatible
+    ) {
+        return Ok(None);
+    }
+
+    let Ok(profile_name) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE") else {
+        return Ok(None);
+    };
+    let profile_name = profile_name.trim();
+    if profile_name.is_empty() {
+        return Ok(None);
+    }
+
+    // Ensure the named profile's OpenRouter-compatible runtime env is present in
+    // validation-only CLI paths too. This is idempotent for an already active
+    // profile, but it also makes the helper robust in focused tests that only set
+    // JCODE_NAMED_PROVIDER_PROFILE.
+    crate::provider_catalog::apply_named_provider_profile_env(profile_name)?;
+
+    let cfg = crate::config::config();
+    let profile = cfg.providers.get(profile_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown provider profile '{}'. Add [providers.{}] to config.toml.",
+            profile_name,
+            profile_name
+        )
+    })?;
+
+    let api_base = crate::provider_catalog::normalize_api_base(&profile.base_url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Provider profile '{}' has invalid base_url '{}'. Use https://... or http://localhost.",
+            profile_name,
+            profile.base_url
+        )
+    })?;
+
+    let api_key_env = std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| profile.api_key_env.clone())
+        .unwrap_or_else(|| "OPENAI_COMPAT_API_KEY".to_string());
+    let env_file = std::env::var("JCODE_OPENROUTER_ENV_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| profile.env_file.clone())
+        .unwrap_or_else(|| "openai-compatible.env".to_string());
+    let requires_api_key = profile
+        .requires_api_key
+        .unwrap_or(!crate::provider_catalog::api_base_uses_localhost(&api_base));
+
+    Ok(Some(
+        crate::provider_catalog::ResolvedOpenAiCompatibleProfile {
+            id: profile_name.to_string(),
+            display_name: profile_name.to_string(),
+            api_base,
+            api_key_env,
+            env_file,
+            setup_url: String::new(),
+            default_model: profile.default_model.clone(),
+            requires_api_key,
+        },
+    ))
 }
 
 pub(crate) fn tool_smoke_skip_detail_for_choice(
@@ -254,6 +341,82 @@ mod nvidia_nim_tool_smoke_tests {
     }
 }
 
+#[cfg(test)]
+mod named_profile_choice_plan_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn named_profile_default_model_skips_generic_openai_compatible_discovery() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let saved: Vec<(String, Option<String>)> = [
+            "JCODE_HOME",
+            "JCODE_NAMED_PROVIDER_PROFILE",
+            "JCODE_PROVIDER_PROFILE_ACTIVE",
+            "JCODE_PROVIDER_PROFILE_NAME",
+            "JCODE_OPENROUTER_API_BASE",
+            "JCODE_OPENROUTER_API_KEY_NAME",
+            "JCODE_OPENROUTER_ENV_FILE",
+            "JCODE_OPENROUTER_MODEL",
+            "JCODE_OPENROUTER_CACHE_NAMESPACE",
+        ]
+        .iter()
+        .map(|key| (key.to_string(), std::env::var(key).ok()))
+        .collect();
+        for (key, _) in &saved {
+            crate::env::remove_var(key);
+        }
+
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"
+[providers.company-gateway]
+type = "openai-compatible"
+base_url = "https://gw.example.com/api/openai"
+auth = "bearer"
+api_key_env = "COMPANY_GATEWAY_KEY"
+env_file = "company-gateway.env"
+default_model = "company-model"
+requires_api_key = true
+"#,
+        )
+        .expect("write config");
+        crate::env::set_var("JCODE_HOME", temp.path().display().to_string());
+        crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "company-gateway");
+        crate::config::invalidate_config_cache();
+
+        let plan = auth_test_choice_plan(
+            &super::super::provider_init::ProviderChoice::OpenaiCompatible,
+            None,
+        )
+        .await
+        .expect("choice plan");
+
+        assert!(
+            matches!(plan, AuthTestChoicePlan::Run { model: None }),
+            "named profile default model should use the active named runtime instead of probing the generic openai-compatible slot: {plan:?}"
+        );
+        assert_eq!(
+            std::env::var("JCODE_OPENROUTER_API_BASE").ok().as_deref(),
+            Some("https://gw.example.com/api/openai")
+        );
+        assert_eq!(
+            std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
+                .ok()
+                .as_deref(),
+            Some("COMPANY_GATEWAY_KEY")
+        );
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => crate::env::set_var(&key, value),
+                None => crate::env::remove_var(&key),
+            }
+        }
+        crate::config::invalidate_config_cache();
+    }
+}
+
 async fn run_provider_smoke_for_choice(
     choice: &super::provider_init::ProviderChoice,
     model: Option<&str>,
@@ -331,7 +494,9 @@ fn validate_auth_test_tool_smoke_transcript(
     for message in messages {
         for block in &message.content {
             match block {
-                crate::message::ContentBlock::ToolUse { id, name, input, .. } => {
+                crate::message::ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     tool_uses.push((id.as_str(), name.as_str(), input));
                 }
                 crate::message::ContentBlock::ToolResult {
@@ -355,7 +520,9 @@ fn validate_auth_test_tool_smoke_transcript(
         id: tool_id.to_string(),
         name: tool_name.to_string(),
         input: input.clone(),
-        intent: None, thought_signature: None, };
+        intent: None,
+        thought_signature: None,
+    };
     if let Some(error) = tool_call.validation_error() {
         anyhow::bail!("tool smoke emitted invalid tool call: {error}");
     }
@@ -587,7 +754,9 @@ mod auth_tool_smoke_tests {
                 vec![crate::message::ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: AUTH_TEST_TOOL_NAME.to_string(),
-                    input: serde_json::json!({"command": AUTH_TEST_TOOL_COMMAND}), thought_signature: None, }],
+                    input: serde_json::json!({"command": AUTH_TEST_TOOL_COMMAND}),
+                    thought_signature: None,
+                }],
             ),
             stored_message(
                 crate::message::Role::User,
