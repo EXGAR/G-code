@@ -784,6 +784,37 @@ fn configured_api_key_source_rejects_invalid_values() {
 }
 
 #[test]
+fn named_openai_compatible_provider_reports_its_configured_api_key_name() {
+    let _lock = crate::storage::lock_test_env();
+    let saved = [
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_OPENROUTER_ENV_FILE",
+        "BAIZHI_API_KEY",
+    ]
+    .into_iter()
+    .map(|key| (key, std::env::var_os(key)))
+    .collect::<Vec<_>>();
+
+    crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "baizhi");
+    crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "BAIZHI_API_KEY");
+    crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", "baizhi.env");
+    crate::env::set_var("BAIZHI_API_KEY", "test-baizhi-key");
+    AuthStatus::invalidate_cache();
+
+    let status = AuthStatus::check_fast();
+    let assessment =
+        status.assessment_for_provider(crate::provider_catalog::OPENAI_COMPAT_LOGIN_PROVIDER);
+    assert_eq!(assessment.state, AuthState::Available);
+    assert_eq!(assessment.method_detail, "API key (`BAIZHI_API_KEY`)");
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
+    AuthStatus::invalidate_cache();
+}
+
+#[test]
 fn anthropic_api_provider_reports_api_key_independently_of_oauth() {
     // Regression: the `anthropic-api` (API-key) login provider used to share the
     // OAuth/subscription credential's availability via `auth_state_key::Anthropic`.

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::process::Command as ProcessCommand;
 
 use crate::{
@@ -8,7 +8,9 @@ use crate::{
 
 use super::{
     args::{Args, Command},
-    dispatch, hot_exec, output, terminal,
+    dispatch, hot_exec, output, provider_arg_rewrite,
+    provider_init::ProviderChoice,
+    terminal,
 };
 
 fn sync_output_style_from_config() {
@@ -217,7 +219,13 @@ pub fn register_external_provider_runtimes() {
 }
 
 fn parse_and_prepare_args() -> Result<Args> {
-    let args = Args::parse();
+    let raw_args = std::env::args_os().collect();
+    let rewritten_args = provider_arg_rewrite::rewrite_named_provider_args(
+        raw_args,
+        |value| ProviderChoice::from_str(value, false).is_ok(),
+        |value| crate::config::config().providers.contains_key(value),
+    );
+    let args = Args::parse_from(rewritten_args);
     startup_profile::mark("args_parse");
 
     if let Some(chord) = args.spawn_hotkey.as_deref() {

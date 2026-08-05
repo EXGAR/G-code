@@ -10,6 +10,7 @@ pub mod login;
 pub mod macos_notification_broker;
 pub mod output;
 pub mod proctitle;
+mod provider_arg_rewrite;
 pub mod provider_doctor;
 pub mod provider_init;
 pub mod selfdev;

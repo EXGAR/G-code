@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::auth;
 use crate::provider_catalog::{
     LoginProviderDescriptor, LoginProviderTarget, OPENAI_COMPAT_LOCAL_ENABLED_ENV,
-    OpenAiCompatibleProfile, resolve_openai_compatible_profile,
+    OpenAiCompatibleProfile, ResolvedOpenAiCompatibleProfile, resolve_openai_compatible_profile,
 };
 
 use super::provider_init::{ProviderChoice, login_provider_for_choice, save_named_api_key};
@@ -412,22 +412,32 @@ fn maybe_persist_default_provider_after_login(
         return;
     }
 
-    let provider_id =
-        crate::provider::MultiProvider::config_default_provider_for_login_provider(provider);
+    let active_named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| cfg.providers.contains_key(value));
+    let provider_id = active_named_profile.clone().or_else(|| {
+        crate::provider::MultiProvider::config_default_provider_for_login_provider(provider)
+            .map(ToString::to_string)
+    });
     let Some(provider_id) = provider_id else {
         return;
     };
 
-    let suggested_model = match provider.target {
-        LoginProviderTarget::OpenAiCompatible(profile) => options
-            .openai_compatible_default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| resolve_openai_compatible_profile(profile).default_model),
-        _ => None,
-    };
+    let suggested_model = active_named_profile
+        .as_deref()
+        .and_then(|name| cfg.providers.get(name))
+        .and_then(|profile| profile.default_model.clone())
+        .or_else(|| match provider.target {
+            LoginProviderTarget::OpenAiCompatible(profile) => options
+                .openai_compatible_default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| resolve_openai_compatible_profile(profile).default_model),
+            _ => None,
+        });
 
     let model_to_save = cfg
         .provider
@@ -435,7 +445,7 @@ fn maybe_persist_default_provider_after_login(
         .as_deref()
         .or(suggested_model.as_deref());
 
-    if let Err(err) = crate::config::Config::set_default_model(model_to_save, Some(provider_id)) {
+    if let Err(err) = crate::config::Config::set_default_model(model_to_save, Some(&provider_id)) {
         crate::logging::warn(&format!(
             "Failed to save {} as the default provider after login: {}",
             provider_id, err
@@ -740,6 +750,10 @@ fn login_openai_compatible_flow(
     profile: &OpenAiCompatibleProfile,
     options: &LoginOptions,
 ) -> Result<()> {
+    if let Some(resolved) = resolve_active_named_provider_login_profile()? {
+        return login_named_openai_compatible_flow(&resolved, options);
+    }
+
     let is_custom_profile = profile.id == crate::provider_catalog::OPENAI_COMPAT_PROFILE.id;
     let mut resolved = resolve_openai_compatible_profile(*profile);
 
@@ -912,6 +926,130 @@ fn login_openai_compatible_flow(
         eprintln!("Default model hint: {}", default_model);
     }
     crate::telemetry::record_auth_success(&resolved.id, auth_method);
+    Ok(())
+}
+
+fn resolve_active_named_provider_login_profile() -> Result<Option<ResolvedOpenAiCompatibleProfile>>
+{
+    let Some(profile_name) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let config = crate::config::Config::load_strict()?;
+    let profile = config.providers.get(&profile_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown provider profile '{}'. Add [providers.{}] to config.toml.",
+            profile_name,
+            profile_name
+        )
+    })?;
+    let api_base =
+        crate::provider_catalog::normalize_api_base(&profile.base_url).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Provider profile '{}' has invalid base_url '{}'.",
+                profile_name,
+                profile.base_url
+            )
+        })?;
+    let (api_key_env, env_file) =
+        crate::provider_catalog::active_named_provider_profile_credential_source()
+            .ok_or_else(|| anyhow::anyhow!("Provider profile '{}' is not active.", profile_name))?;
+    let requires_api_key = !matches!(profile.auth, crate::config::NamedProviderAuth::None)
+        && profile
+            .requires_api_key
+            .unwrap_or(!crate::provider_catalog::api_base_uses_localhost(&api_base));
+
+    Ok(Some(ResolvedOpenAiCompatibleProfile {
+        id: profile_name.clone(),
+        display_name: profile_name,
+        api_base,
+        api_key_env,
+        env_file,
+        setup_url: String::new(),
+        default_model: profile.default_model.clone(),
+        requires_api_key,
+    }))
+}
+
+fn login_named_openai_compatible_flow(
+    resolved: &ResolvedOpenAiCompatibleProfile,
+    options: &LoginOptions,
+) -> Result<()> {
+    if options.openai_compatible_api_base.is_some()
+        || options.openai_compatible_api_key_env.is_some()
+    {
+        anyhow::bail!(
+            "Provider profile '{}' already defines base_url and api_key_env in config.toml; edit [providers.{}] to change them.",
+            resolved.id,
+            resolved.id
+        );
+    }
+
+    eprintln!(
+        "Using configured provider profile '{}'...",
+        resolved.display_name
+    );
+    eprintln!("Endpoint: {}", resolved.api_base);
+    if let Some(default_model) = resolved.default_model.as_deref() {
+        eprintln!("Default model: {}", default_model);
+    }
+
+    if resolved.requires_api_key {
+        eprintln!("API key env variable: {}", resolved.api_key_env);
+        let supplied_key = options
+            .openai_compatible_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(key) = supplied_key {
+            save_named_api_key(&resolved.env_file, &resolved.api_key_env, key)?;
+            eprintln!("Successfully saved {} API key.", resolved.display_name);
+        } else if crate::provider_catalog::load_api_key_from_env_or_config(
+            &resolved.api_key_env,
+            &resolved.env_file,
+        )
+        .is_some()
+        {
+            eprintln!("Using the existing configured API key.");
+        } else {
+            if !io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "Non-interactive login for provider profile '{}' requires --api-key.",
+                    resolved.id
+                );
+            }
+            eprint!("Paste your {} API key: ", resolved.display_name);
+            io::stdout().flush()?;
+            let key = read_secret_line()?;
+            if key.trim().is_empty() {
+                anyhow::bail!("No API key provided.");
+            }
+            save_named_api_key(&resolved.env_file, &resolved.api_key_env, key.trim())?;
+            eprintln!("Successfully saved {} API key.", resolved.display_name);
+        }
+    } else {
+        eprintln!("This configured provider profile does not require an API key.");
+    }
+
+    eprintln!(
+        "Credential file: {}",
+        crate::storage::app_config_dir()?
+            .join(&resolved.env_file)
+            .display()
+    );
+    crate::telemetry::record_auth_success(
+        &resolved.id,
+        if resolved.requires_api_key {
+            "api_key"
+        } else {
+            "no_auth"
+        },
+    );
     Ok(())
 }
 
