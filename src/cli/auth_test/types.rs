@@ -276,23 +276,22 @@ impl AuthTestSmokeKind {
         "Skipped: provider is auth/tool-only and has no model runtime smoke step."
     }
 
-    fn success_detail(self) -> &'static str {
+    fn success_detail(self, expected_output: &str) -> String {
         match self {
-            Self::Provider => "Provider returned AUTH_TEST_OK.",
-            Self::Tool => {
-                "Tool-enabled provider request returned AUTH_TEST_OK after one validated real Jcode bash tool call, successful registry execution, and tool-result followup."
-            }
+            Self::Provider => format!("Provider returned {expected_output}."),
+            Self::Tool => format!(
+                "Tool-enabled provider request returned {expected_output} after one validated real Jcode bash tool call, successful registry execution, and tool-result followup."
+            ),
         }
     }
 
-    fn failure_detail(self, output: &str) -> String {
+    fn failure_detail(self, output: &str, expected_output: &str) -> String {
         match self {
-            Self::Provider => {
-                format!("Provider response did not contain AUTH_TEST_OK: {}", output)
-            }
+            Self::Provider => format!(
+                "Provider response did not contain {expected_output}: {output}"
+            ),
             Self::Tool => format!(
-                "Tool-enabled provider response did not contain AUTH_TEST_OK: {}",
-                output
+                "Tool-enabled provider response did not contain {expected_output}: {output}"
             ),
         }
     }
