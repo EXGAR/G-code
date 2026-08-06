@@ -29,8 +29,10 @@ use crate::compaction::CompactionEvent;
 use crate::id;
 use crate::logging;
 use crate::message::{
-    ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall, ToolDefinition,
+    ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall,
+    ToolDefinition,
 };
+use jcode_message_types::ToolConcurrencyMode;
 use crate::protocol::{HistoryMessage, ServerEvent};
 use crate::provider::{NativeToolResult, Provider, ProviderRuntimeState};
 use crate::session::{GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage};
@@ -249,6 +251,18 @@ pub struct Agent {
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
     inline_tail: inline_tail::InlineTailBuffer,
+    /// Steering messages: injected mid-task to redirect the agent without
+    /// losing context. Checked after each turn completes. Messages are
+    /// consumed from the front of the queue.
+    steering_queue: Vec<String>,
+    /// Follow-up messages: queued work that runs after the agent would
+    /// otherwise stop (no more tool calls and empty steering queue).
+    follow_up_queue: Vec<String>,
+    /// Global tool execution concurrency mode: "parallel" (default) or
+    /// "sequential". When sequential, tools execute one at a time. Even
+    /// in parallel mode, any tool with ToolConcurrencyMode::Sequential
+    /// forces the entire batch to run sequentially.
+    tool_concurrency: ToolConcurrencyMode,
 }
 
 impl Agent {
@@ -302,6 +316,9 @@ impl Agent {
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
+            steering_queue: Vec::new(),
+            follow_up_queue: Vec::new(),
+            tool_concurrency: ToolConcurrencyMode::Parallel,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -1000,6 +1017,73 @@ impl Agent {
             }
         }
         md
+    }
+}
+
+/// Steering and Follow-up queue management (Pi-style agent control).
+impl Agent {
+    /// Push a steering message that will be injected at the next turn
+    /// boundary, redirecting the agent without losing context.
+    pub fn steer(&mut self, message: String) {
+        let len = message.len();
+        self.steering_queue.push(message);
+        logging::info(&format!(
+            "Steering message queued for session {} ({} chars)",
+            self.session.id,
+            len
+        ));
+    }
+
+    /// Push a follow-up message that will run after the agent would
+    /// otherwise stop (no more tool calls and steering queue empty).
+    pub fn follow_up(&mut self, message: String) {
+        let len = message.len();
+        self.follow_up_queue.push(message);
+        logging::info(&format!(
+            "Follow-up message queued for session {} ({} chars)",
+            self.session.id,
+            len
+        ));
+    }
+
+    /// Clear all queued steering messages.
+    pub fn clear_steering_queue(&mut self) {
+        self.steering_queue.clear();
+    }
+
+    /// Clear all queued follow-up messages.
+    pub fn clear_follow_up_queue(&mut self) {
+        self.follow_up_queue.clear();
+    }
+
+    /// Clear both steering and follow-up queues.
+    pub fn clear_all_queues(&mut self) {
+        self.steering_queue.clear();
+        self.follow_up_queue.clear();
+    }
+
+    /// Returns true if steering messages are pending.
+    pub fn has_pending_steering(&self) -> bool {
+        !self.steering_queue.is_empty()
+    }
+
+    /// Drain one steering message from the queue. Returns the message text
+    /// if one was available.
+    fn take_steering_message(&mut self) -> Option<String> {
+        if self.steering_queue.is_empty() {
+            None
+        } else {
+            Some(self.steering_queue.remove(0))
+        }
+    }
+
+    /// Drain one follow-up message from the queue.
+    fn take_follow_up_message(&mut self) -> Option<String> {
+        if self.follow_up_queue.is_empty() {
+            None
+        } else {
+            Some(self.follow_up_queue.remove(0))
+        }
     }
 }
 

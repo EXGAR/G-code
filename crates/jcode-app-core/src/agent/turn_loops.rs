@@ -857,6 +857,10 @@ impl Agent {
                 tool_calls.len()
             ));
 
+            // Capture whether we had tool calls before the for-loop consumes
+            // the vector, so follow-up logic can check it afterwards.
+            let had_tool_calls = !tool_calls.is_empty();
+
             // If provider handles tools internally (like Claude Code CLI), only run native tools locally
             if self.provider.handles_tools_internally() {
                 tool_calls.retain(|tc| JCODE_NATIVE_TOOLS.contains(&tc.name.as_str()));
@@ -879,6 +883,30 @@ impl Agent {
 
             // Execute tools and add results
             let mut tool_results_dirty = false;
+
+            // Determine if any tool in the batch requires sequential execution.
+            // If the global config is sequential, or any individual tool is
+            // sequential, the entire batch runs one at a time (Pi-style).
+            let tool_defs = self.tool_definitions().await;
+            let mut batch_needs_sequential = self.tool_concurrency == ToolConcurrencyMode::Sequential;
+            if !batch_needs_sequential {
+                for tc in &tool_calls {
+                    if tool_defs.iter().any(|def| def.name == tc.name && def.execution_mode == Some(ToolConcurrencyMode::Sequential)) {
+                        batch_needs_sequential = true;
+                        break;
+                    }
+                }
+            }
+
+            if batch_needs_sequential {
+                logging::info(&format!(
+                    "Tool batch executing sequentially ({} calls)",
+                    tool_calls.len()
+                ));
+                // TODO(G-code): When batch_needs_sequential is false, execute
+                // tools concurrently via join_all (Pi-style parallel execution).
+            }
+
             for tc in tool_calls {
                 let message_id = assistant_message_id
                     .clone()
@@ -1114,6 +1142,45 @@ impl Agent {
                     injected.len(),
                     total_chars
                 ));
+            }
+
+            // Pi-style steering: inject queued messages after each turn.
+            // Steering takes priority over follow-up; follow-up only runs
+            // when there are no tool calls and no pending steering.
+            if let Some(steering_msg) = self.take_steering_message() {
+                logging::info(&format!(
+                    "Steering message injected ({} chars)",
+                    steering_msg.len()
+                ));
+                self.add_message(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: steering_msg,
+                        cache_control: None,
+                    }],
+                );
+                self.session.save()?;
+                continue;
+            }
+
+            // Pi-style follow-up: queued work that runs after the agent
+            // would otherwise stop (no tool calls, no steering).
+            if !had_tool_calls {
+                if let Some(follow_up_msg) = self.take_follow_up_message() {
+                    logging::info(&format!(
+                        "Follow-up message injected ({} chars)",
+                        follow_up_msg.len()
+                    ));
+                    self.add_message(
+                        Role::User,
+                        vec![ContentBlock::Text {
+                            text: follow_up_msg,
+                            cache_control: None,
+                        }],
+                    );
+                    self.session.save()?;
+                    continue;
+                }
             }
         }
 
