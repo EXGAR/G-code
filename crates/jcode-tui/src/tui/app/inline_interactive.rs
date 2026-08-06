@@ -3404,6 +3404,19 @@ impl App {
                             }
                         }
                     }
+                    PickerAction::Skill { name } => {
+                        self.inline_interactive_state = None;
+                        // Setting input to /<skill-name> triggers the existing
+                        // skill-invocation path in submit_user_input.
+                        self.input = format!("/{}", name);
+                        self.cursor_pos = self.input.len();
+                        self.active_skill = Some(name.clone());
+                        self.push_display_message(DisplayMessage::system(format!(
+                            "Activated skill: {}",
+                            name
+                        )));
+                        self.set_status_notice(format!("Skill → /{}", name));
+                    }
                     PickerAction::Model => {
                         if !route.available {
                             self.push_display_message(DisplayMessage::error(

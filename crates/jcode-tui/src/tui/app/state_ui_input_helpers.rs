@@ -346,21 +346,8 @@ impl App {
             return cache.candidates.clone();
         }
 
-        fn push_skill_commands(
-            commands: &mut Vec<(String, &'static str)>,
-            seen: &mut std::collections::HashSet<String>,
-            skills: &crate::skill::SkillRegistry,
-        ) {
-            for skill in skills.list() {
-                let command = format!("/{}", skill.name);
-                if seen.insert(command.clone()) {
-                    commands.push((command, "Activate skill"));
-                }
-            }
-        }
-
         let mut seen = std::collections::HashSet::new();
-        let mut commands: Vec<(String, &'static str)> = REGISTERED_COMMANDS
+        let commands: Vec<(String, &'static str)> = REGISTERED_COMMANDS
             .iter()
             .filter(|command| !command.hidden)
             .filter_map(|command| {
@@ -369,17 +356,8 @@ impl App {
             })
             .collect();
 
-        let skills = self.current_skills_snapshot();
-        push_skill_commands(&mut commands, &mut seen, &skills);
-
-        if self.is_remote && !self.remote_skills.is_empty() {
-            for skill in &self.remote_skills {
-                let command = format!("/{skill}");
-                if seen.insert(command.clone()) {
-                    commands.push((command, "Activate skill"));
-                }
-            }
-        }
+        // Skills are no longer flattened into the slash-command palette.
+        // Use /skills to open the interactive skills picker instead.
 
         *self.command_candidates_cache.borrow_mut() = Some(CommandCandidatesCache {
             candidates: commands.clone(),
@@ -1248,6 +1226,7 @@ impl App {
                     input.starts_with("/model") || input.starts_with("/models")
                 }
                 crate::tui::PickerKind::Login => input.starts_with("/login"),
+                crate::tui::PickerKind::Skills => input.starts_with("/skills"),
                 _ => false,
             };
             if suppress {

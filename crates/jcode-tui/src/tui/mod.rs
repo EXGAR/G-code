@@ -887,6 +887,7 @@ pub enum PickerKind {
     Account,
     Login,
     Usage,
+    Skills,
 }
 
 /// Render snapshot of the Ctrl+R reverse prompt-history search overlay.
@@ -1101,6 +1102,17 @@ impl PickerKind {
                 shows_default_shortcut_hint: false,
                 preview_activation_column: 2,
             },
+            Self::Skills => InlineInteractiveSchema {
+                layout: InlineInteractiveLayout::Compact,
+                primary_label: "SKILL",
+                secondary_label: "PATH",
+                secondary_preview_label: "PATH",
+                tertiary_label: "",
+                preview_submit_hint: "  ↵ activate",
+                active_submit_hint: "  ↑↓/jk ↵ Esc",
+                shows_default_shortcut_hint: false,
+                preview_activation_column: 0,
+            },
         }
     }
 
@@ -1147,6 +1159,13 @@ impl PickerKind {
                     .map(|option| option.detail.as_str())
                     .unwrap_or("");
                 format!("{} {} {} {}", entry.name, status, window, detail)
+            }
+            Self::Skills => {
+                let path = entry
+                    .active_option()
+                    .map(|option| option.provider.as_str())
+                    .unwrap_or("");
+                format!("{} {}", entry.name, path)
             }
             Self::Model => {
                 let route = entry.active_option();
@@ -1203,6 +1222,9 @@ pub enum PickerAction {
         target: AgentModelTarget,
         clear_override: bool,
     },
+    Skill {
+        name: String,
+    },
 }
 
 /// Unified inline picker with three columns.
@@ -1245,6 +1267,7 @@ fn estimate_picker_action_bytes(action: &PickerAction) -> usize {
         PickerAction::Model
         | PickerAction::AgentTarget(_)
         | PickerAction::AgentModelChoice { .. }
+        | PickerAction::Skill { .. }
         | PickerAction::LogoutAll => 0,
         PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => {
             provider_id.capacity() + label.capacity()

@@ -13,6 +13,10 @@ impl App {
         slash_command_preview_filter(input, &["/login"])
     }
 
+    pub(crate) fn skills_picker_preview_filter(input: &str) -> Option<String> {
+        slash_command_preview_filter(input, &["/skills"])
+    }
+
     fn account_picker_preview_request(&self, input: &str) -> Option<InlinePickerPreviewRequest> {
         let trimmed = input.trim_start();
         let rest = trimmed
@@ -106,6 +110,10 @@ impl App {
                     .map(|filter| InlinePickerPreviewRequest::Login { filter })
             })
             .or_else(|| self.account_picker_preview_request(input))
+            .or_else(|| {
+                Self::skills_picker_preview_filter(input)
+                    .map(|filter| InlinePickerPreviewRequest::Skills { filter })
+            })
     }
 
     pub(crate) fn sync_model_picker_preview_from_input(&mut self) {

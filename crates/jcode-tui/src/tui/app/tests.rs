@@ -852,47 +852,16 @@ fn version_command_shows_remote_server_identity_and_update_status() {
 }
 
 #[test]
-fn skills_command_lists_loaded_and_endorsed_skills() {
+fn skills_command_opens_interactive_picker() {
     let mut app = create_test_app();
 
     assert!(super::state_ui::handle_info_command(&mut app, "/skills"));
-    let content = app.display_messages().last().unwrap().content.clone();
 
-    assert!(content.contains("Loaded skills"), "{content}");
-    assert!(
-        content.contains("Endorsed skills (recommended by jcode)"),
-        "{content}"
-    );
-    // Every endorsed skill should appear with an install status marker.
-    for endorsed in crate::skill::endorsed_skills() {
-        assert!(
-            content.contains(&format!("/{}", endorsed.name)),
-            "expected endorsed skill /{} in:\n{content}",
-            endorsed.name
-        );
-    }
-    assert!(
-        content.contains("[installed]") || content.contains("[not installed]"),
-        "{content}"
-    );
-    // NVIDIA CUDA-X skills are grouped under their own category with install hints.
-    assert!(content.contains("NVIDIA CUDA-X"), "{content}");
-    assert!(
-        content.contains("/cuopt-numerical-optimization-api-python"),
-        "{content}"
-    );
-    assert!(
-        content.contains("install: npx skills add nvidia/skills"),
-        "{content}"
-    );
-    assert!(
-        content.contains("https://github.com/NVIDIA/skills"),
-        "{content}"
-    );
-    assert_eq!(
-        app.display_messages().last().unwrap().title.as_deref(),
-        Some("Skills")
-    );
+    // Verify the inline interactive skills picker is opened.
+    let picker = app.inline_interactive_state.as_ref().expect("picker should be open");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Skills);
+    // Input should be cleared since picker focuses.
+    assert!(app.input.is_empty());
 }
 
 #[test]
@@ -903,21 +872,18 @@ fn skills_command_marks_active_skill_in_remote_mode() {
     app.active_skill = Some("optimization".to_string());
 
     assert!(super::state_ui::handle_info_command(&mut app, "/skills"));
-    let content = app.display_messages().last().unwrap().content.clone();
 
-    assert!(content.contains("- /optimization (active)"), "{content}");
-    assert!(content.contains("- /firefox-browser\n"), "{content}");
-    // Endorsed list should mark remote-installed skills as installed.
-    assert!(
-        content.contains("/firefox-browser [installed]"),
-        "{content}"
-    );
+    // Picker should be open with skills entries.
+    let picker = app.inline_interactive_state.as_ref().expect("picker should be open");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Skills);
+    // Active skill should be marked.
+    let active_entry = picker.entries.iter().find(|e| e.is_current);
+    assert!(active_entry.is_some(), "active skill should be marked");
+    assert_eq!(active_entry.unwrap().name, "optimization");
 }
 
 /// Regression for issue #431 (and #457): skills added on disk after startup
-/// must show up in `/skills` and the skills snapshot without a session
-/// restart. With the session-scoped project overlay, project-local skills are
-/// visible immediately, without even running `/skills` first.
+/// must show up in the `/skills` picker without a session restart.
 #[test]
 fn skills_command_refreshes_registry_from_disk_before_listing() {
     let mut app = create_test_app();
@@ -942,11 +908,12 @@ fn skills_command_refreshes_registry_from_disk_before_listing() {
     );
 
     assert!(super::state_ui::handle_info_command(&mut app, "/skills"));
-    let content = app.display_messages().last().unwrap().content.clone();
 
+    // Picker should be open and contain the late-added skill.
+    let picker = app.inline_interactive_state.as_ref().expect("picker should be open");
     assert!(
-        content.contains("- /late-skill"),
-        "expected late-added skill in /skills output:\n{content}"
+        picker.entries.iter().any(|e| e.name == "late-skill"),
+        "expected late-added skill in /skills picker"
     );
     assert!(
         app.current_skills_snapshot().get("late-skill").is_some(),

@@ -12,6 +12,9 @@ pub(super) enum InlinePickerPreviewRequest {
         provider_filter: Option<String>,
         filter: String,
     },
+    Skills {
+        filter: String,
+    },
 }
 
 impl InlinePickerPreviewRequest {
@@ -20,12 +23,16 @@ impl InlinePickerPreviewRequest {
             Self::Model { .. } => PickerKind::Model,
             Self::Login { .. } => PickerKind::Login,
             Self::Account { .. } => PickerKind::Account,
+            Self::Skills { .. } => PickerKind::Skills,
         }
     }
 
     pub(super) fn filter(&self) -> &str {
         match self {
-            Self::Model { filter } | Self::Login { filter } | Self::Account { filter, .. } => {
+            Self::Model { filter }
+            | Self::Login { filter }
+            | Self::Account { filter, .. }
+            | Self::Skills { filter } => {
                 filter
             }
         }
@@ -48,6 +55,7 @@ impl InlinePickerPreviewRequest {
             Self::Account {
                 provider_filter, ..
             } => app.open_account_picker(provider_filter.as_deref()),
+            Self::Skills { .. } => app.open_skills_picker(),
         }
     }
 
@@ -89,6 +97,7 @@ pub(super) fn picker_account_provider_scope(picker: &InlineInteractiveState) -> 
         | PickerAction::LogoutAll
         | PickerAction::Usage { .. }
         | PickerAction::AgentTarget(_)
-        | PickerAction::AgentModelChoice { .. } => None,
+        | PickerAction::AgentModelChoice { .. }
+        | PickerAction::Skill { .. } => None,
     })
 }

@@ -284,4 +284,92 @@ impl App {
             picker.filter.clear();
         }
     }
+
+    pub(crate) fn open_skills_picker(&mut self) {
+        self.refresh_skills_snapshot();
+        let active = self.active_skill().map(|s| s.to_string());
+
+        let entries: Vec<PickerEntry> = if self.is_remote && !self.remote_skills.is_empty() {
+            let mut names = self.remote_skills.clone();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    let is_active = active.as_deref() == Some(name.as_str());
+                    PickerEntry {
+                        name: name.clone(),
+                        options: vec![PickerOption {
+                            provider: String::new(),
+                            api_method: String::new(),
+                            available: true,
+                            detail: String::new(),
+                            estimated_reference_cost_micros: None,
+                        }],
+                        action: PickerAction::Skill { name },
+                        selected_option: 0,
+                        is_current: is_active,
+                        is_default: false,
+                        is_favorite: false,
+                        recommended: false,
+                        recommendation_rank: usize::MAX,
+                        usage_score: 0,
+                        old: false,
+                        created_date: None,
+                        effort: None,
+                    }
+                })
+                .collect()
+        } else {
+            let snapshot = self.current_skills_snapshot();
+            let mut skills: Vec<&crate::skill::Skill> = snapshot.list();
+            skills.sort_by(|a, b| a.name.cmp(&b.name));
+            skills
+                .into_iter()
+                .map(|skill| {
+                    let is_active = active.as_deref() == Some(skill.name.as_str());
+                    PickerEntry {
+                        name: skill.name.clone(),
+                        options: vec![PickerOption {
+                            provider: skill.path.display().to_string(),
+                            api_method: skill.description.clone(),
+                            available: true,
+                            detail: String::new(),
+                            estimated_reference_cost_micros: None,
+                        }],
+                        action: PickerAction::Skill {
+                            name: skill.name.clone(),
+                        },
+                        selected_option: 0,
+                        is_current: is_active,
+                        is_default: false,
+                        is_favorite: false,
+                        recommended: false,
+                        recommendation_rank: usize::MAX,
+                        usage_score: 0,
+                        old: false,
+                        created_date: None,
+                        effort: None,
+                    }
+                })
+                .collect()
+        };
+
+        let count = entries.len();
+        self.inline_view_state = None;
+        self.inline_interactive_state = Some(InlineInteractiveState {
+            kind: PickerKind::Skills,
+            filtered: if count > 0 {
+                (0..count).collect()
+            } else {
+                Vec::new()
+            },
+            entries,
+            selected: 0,
+            column: 0,
+            filter: String::new(),
+            preview: false,
+        });
+        self.input.clear();
+        self.cursor_pos = 0;
+    }
 }

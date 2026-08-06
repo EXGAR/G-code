@@ -886,9 +886,8 @@ fn test_top_level_command_suggestions_include_config_and_subscription() {
 fn test_top_level_command_suggestions_include_project_local_skills() {
     let mut app = create_test_app();
 
-    // Hermetic project-local skill: the suggestion list must surface skills
-    // found under <working_dir>/.jcode/skills, independent of the skills
-    // installed on the machine running the tests.
+    // Skills are no longer in the flat slash-command suggestion palette.
+    // They appear in the interactive /skills picker instead.
     let temp = tempfile::tempdir().expect("tempdir");
     let skill_dir = temp
         .path()
@@ -904,9 +903,14 @@ fn test_top_level_command_suggestions_include_project_local_skills() {
     app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
     app.refresh_skills_snapshot();
 
-    let suggestions = app.get_suggestions_for("/optim");
-
-    assert!(suggestions.iter().any(|(cmd, _)| cmd == "/optimization"));
+    // /skills should open the interactive picker.
+    assert!(super::state_ui::handle_info_command(&mut app, "/skills"));
+    let picker = app.inline_interactive_state.as_ref().expect("picker should be open");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Skills);
+    assert!(
+        picker.entries.iter().any(|e| e.name == "optimization"),
+        "skills picker should contain the project-local skill"
+    );
 }
 
 #[test]
