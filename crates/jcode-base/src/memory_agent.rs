@@ -166,6 +166,18 @@ fn manager_for_working_dir(working_dir: Option<&str>) -> MemoryManager {
 }
 
 async fn run_final_extraction(transcript: String, session_id: String, working_dir: Option<String>) {
+    // Respect the memory sidecar opt-out. Extraction is LLM-backed, so it must
+    // not construct a sidecar (which would silently fall back to the OpenAI
+    // OAuth account) when the user disabled the sidecar. Mirror the gate used
+    // by in-turn extraction (turn_memory) and the rerank judge.
+    if !memory::memory_llm_judge_available() {
+        crate::logging::info(&format!(
+            "Final extraction skipped for session {}: LLM judge unavailable",
+            session_id
+        ));
+        return;
+    }
+
     crate::logging::info(&format!(
         "Final extraction starting for session {} ({} chars)",
         session_id,
