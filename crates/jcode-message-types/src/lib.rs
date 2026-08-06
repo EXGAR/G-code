@@ -23,6 +23,21 @@ pub struct ToolDefinition {
     /// ToolDefinition::description_token_estimate() when reviewing tool bloat.
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Controls whether this tool can run concurrently with other tool calls
+    /// in the same batch. "sequential" forces the entire batch to execute
+    /// one at a time; "parallel" allows concurrent execution. Defaults to
+    /// None (inherit from global agent config).
+    #[serde(skip)]
+    pub execution_mode: Option<ToolConcurrencyMode>,
+}
+
+/// Per-tool execution concurrency hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ToolConcurrencyMode {
+    #[serde(rename = "parallel")]
+    Parallel,
+    #[serde(rename = "sequential")]
+    Sequential,
 }
 
 impl ToolDefinition {

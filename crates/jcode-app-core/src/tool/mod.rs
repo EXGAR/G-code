@@ -685,15 +685,38 @@ impl Registry {
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
         );
 
+        // Per-tool before_tool_call hook (Pi-style). Tools can block execution.
+        if let Err(reason) = tool.before_tool_call(&input, &ctx).await {
+            crate::logging::event_warn(
+                "TOOL_LIFECYCLE",
+                Self::tool_lifecycle_fields("blocked_by_tool_hook", name, resolved_name, &input, &ctx),
+            );
+            return Err(anyhow::anyhow!("Tool call blocked by tool hook: {reason}"));
+        }
+
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+        // Per-tool after_tool_call hook (Pi-style). Tools can annotate, override, or terminate.
+        let hook_result = tool.after_tool_call(&input, &result, &ctx).await;
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
 
         let mut output = match result {
-            Ok(output) => output,
+            Ok(mut output) => {
+                // Apply after_tool_call hook annotations
+                if let Some(ref hook) = hook_result {
+                    if let Some(ref annotation) = hook.annotation {
+                        output.output = format!("{}\n\n[{}]", output.output, annotation);
+                    }
+                    if let Some(ref override_text) = hook.override_output {
+                        output.output = override_text.clone();
+                    }
+                }
+                output
+            }
             Err(error) => {
                 let mut fields =
                     Self::tool_lifecycle_fields("error", name, resolved_name, &input, &ctx);

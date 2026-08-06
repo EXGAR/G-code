@@ -1,3 +1,15 @@
+#[derive(Debug, Clone)]
+pub struct ToolHookResult {
+    /// If true, the agent loop skips the automatic follow-up LLM call
+    /// after this batch (only takes effect when every finalized tool
+    /// in the batch also sets `terminate: true`).
+    pub terminate: bool,
+    /// Optional human-readable annotation appended to the tool result.
+    pub annotation: Option<String>,
+    /// Override the tool output entirely (replaces the actual result).
+    pub override_output: Option<String>,
+}
+
 use anyhow::Result;
 use async_trait::async_trait;
 use jcode_agent_runtime::InterruptSignal;
@@ -155,12 +167,41 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given input.
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput>;
 
+    /// Hook called before tool execution. Return `true` to block execution.
+    /// The returned string is the reason visible to the model.
+    async fn before_tool_call(
+        &self,
+        _input: &Value,
+        _ctx: &ToolContext,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Hook called after tool execution completes (success or error).
+    /// Return `None` to proceed normally; return `Some(ToolHookResult)` to
+    /// override or annotate the result before it reaches the model.
+    async fn after_tool_call(
+        &self,
+        _input: &Value,
+        _output: &Result<ToolOutput, anyhow::Error>,
+        _ctx: &ToolContext,
+    ) -> Option<ToolHookResult> {
+        None
+    }
+
+    /// Return the per-tool concurrency hint. Defaults to None (inherit from
+    /// the agent's global tool execution config).
+    fn concurrency_mode(&self) -> Option<jcode_message_types::ToolConcurrencyMode> {
+        None
+    }
+
     /// Convert to API tool definition.
     fn to_definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
             description: self.description().to_string(),
             input_schema: ensure_intent_in_schema(self.parameters_schema()),
+            execution_mode: self.concurrency_mode(),
         }
     }
 }
