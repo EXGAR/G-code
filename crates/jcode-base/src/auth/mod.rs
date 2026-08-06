@@ -604,7 +604,21 @@ impl AuthStatus {
             crate::provider_catalog::LoginProviderTarget::OpenAiCompatible(profile) => {
                 let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
                 if self.state_for_provider(provider) == AuthState::Available {
-                    if resolved.requires_api_key {
+                    if let Some((key_env, env_file)) =
+                        crate::provider_catalog::active_named_provider_profile_credential_source()
+                    {
+                        if crate::provider_catalog::load_api_key_from_env_or_config(
+                            &key_env, &env_file,
+                        )
+                        .is_some()
+                        {
+                            format!("API key (`{key_env}`)")
+                        } else if let Ok(api_base) = std::env::var("JCODE_OPENROUTER_API_BASE") {
+                            format!("configured endpoint (`{api_base}`)")
+                        } else {
+                            "configured endpoint (no API key required)".to_string()
+                        }
+                    } else if resolved.requires_api_key {
                         format!("API key (`{}`)", resolved.api_key_env)
                     } else if crate::provider_catalog::load_api_key_from_env_or_config(
                         &resolved.api_key_env,

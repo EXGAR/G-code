@@ -26,15 +26,16 @@ async fn maybe_run_auth_test_smoke(
         }
         match kind.run(target, model, prompt).await {
             Ok(output) => {
-                let ok = output.contains("AUTH_TEST_OK");
+                let expected_output = auth_test_expected_output(prompt);
+                let ok = output.contains(expected_output);
                 kind.set_output(report, output.clone());
                 report.push_step(
                     kind.step_name(),
                     ok,
                     if ok {
-                        kind.success_detail().to_string()
+                        kind.success_detail(expected_output)
                     } else {
-                        kind.failure_detail(&output)
+                        kind.failure_detail(&output, expected_output)
                     },
                 );
             }
@@ -67,15 +68,16 @@ async fn maybe_run_auth_test_smoke_for_choice(
                 }
                 match kind.run_for_choice(choice, model.as_deref(), prompt).await {
                     Ok(output) => {
-                        let ok = output.contains("AUTH_TEST_OK");
+                        let expected_output = auth_test_expected_output(prompt);
+                        let ok = output.contains(expected_output);
                         kind.set_output(report, output.clone());
                         report.push_step(
                             kind.step_name(),
                             ok,
                             if ok {
-                                kind.success_detail().to_string()
+                                kind.success_detail(expected_output)
                             } else {
-                                kind.failure_detail(&output)
+                                kind.failure_detail(&output, expected_output)
                             },
                         );
                     }
@@ -435,8 +437,9 @@ pub async fn run_auth_test_command(
     output_path: Option<&str>,
 ) -> Result<()> {
     let targets = resolve_auth_test_targets(choice, all_configured)?;
-    let provider_smoke_prompt = prompt.unwrap_or(DEFAULT_AUTH_TEST_PROVIDER_PROMPT);
-    let tool_smoke_prompt = prompt.unwrap_or(DEFAULT_AUTH_TEST_TOOL_PROMPT);
+    let prompt_plan = auth_test_prompt_plan(prompt);
+    let provider_smoke_prompt = prompt_plan.provider_prompt;
+    let tool_smoke_prompt = prompt_plan.tool_prompt;
 
     let mut reports = Vec::new();
     for target in targets {

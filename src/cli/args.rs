@@ -483,7 +483,7 @@ pub(crate) enum Command {
         #[arg(long)]
         no_tool_smoke: bool,
 
-        /// Custom smoke prompt (default asks for AUTH_TEST_OK)
+        /// Custom provider smoke prompt (tool smoke keeps its strict built-in prompt)
         #[arg(long)]
         prompt: Option<String>,
 
