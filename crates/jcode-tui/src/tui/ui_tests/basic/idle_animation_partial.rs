@@ -107,6 +107,34 @@ fn draw_publishes_the_animated_rows_only_when_the_animation_rendered() {
     );
 }
 
+/// Ghostty commonly runs maximized with a much taller viewport than the compact
+/// empty-state content needs. The packed layout must leave that surplus as
+/// transcript space; otherwise all chunks end above the viewport bottom and
+/// Ghostty composes the image-protocol animation against stale geometry, making
+/// it visually occupy almost the whole TUI.
+#[test]
+fn a_tall_ghostty_viewport_keeps_the_idle_animation_at_its_reserved_height() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
+    let _lock = viewport_snapshot_test_lock();
+    pin_full_tier();
+    clear_flicker_frame_history_for_tests();
+
+    let idle = idle_animation_state(1.0);
+    let terminal = render_full(&idle, 240, 100);
+    let area = crate::tui::ui::last_idle_animation_area()
+        .expect("the tall idle screen must publish the animated rectangle");
+
+    assert_eq!(
+        area.height, 14,
+        "the animation absorbed surplus viewport height in Ghostty: {area:?}"
+    );
+    assert_eq!(
+        area.bottom(),
+        terminal.backend().buffer().area().bottom(),
+        "the reserved animation rows must stay anchored to the bottom"
+    );
+}
+
 #[test]
 fn partial_repaint_matches_a_full_frame_at_the_same_animation_time() {
     let _idle_animation = IdleAnimationEnvGuard::enable();

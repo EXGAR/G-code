@@ -3137,7 +3137,14 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         .direction(Direction::Vertical)
         .constraints(if use_packed {
             vec![
-                Constraint::Length(if terminal_clear_collapsed {
+                // Even when the transcript content is packed, its chunk owns
+                // the viewport's flexible space. If every chunk is `Length`,
+                // ratatui leaves surplus rows after the final animation chunk;
+                // Ghostty then composes image-protocol frames against geometry
+                // that ends well above the viewport and the animation appears
+                // to cover the TUI. `Min` preserves the content's lower bound
+                // while anchoring status, input, and animation to the bottom.
+                Constraint::Min(if terminal_clear_collapsed {
                     0
                 } else {
                     content_height.max(1)
