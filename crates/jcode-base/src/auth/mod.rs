@@ -1000,19 +1000,6 @@ fn record_auth_probe_step(
     timings.push((name, step_start.elapsed().as_millis()));
 }
 
-fn token_state(result: anyhow::Result<bool>) -> AuthState {
-    match result {
-        Ok(is_expired) => {
-            if is_expired {
-                AuthState::Expired
-            } else {
-                AuthState::Available
-            }
-        }
-        Err(_) => AuthState::NotConfigured,
-    }
-}
-
 /// Auth state for an OAuth credential that refreshes automatically.
 ///
 /// A short-lived access token is *not* a broken login. Antigravity/Gemini
@@ -1085,7 +1072,7 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
 }
 
 fn probe_openrouter_status(status: &mut AuthStatus) {
-    if crate::provider::openrouter::has_credentials() {
+    if crate::provider::openrouter::has_openrouter_credentials() {
         status.openrouter = AuthState::Available;
     }
 }

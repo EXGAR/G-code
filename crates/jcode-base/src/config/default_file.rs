@@ -132,7 +132,7 @@ pin_images = true
 
 # Pin the full session todo list to the top of the chat transcript while it
 # scrolls, like the sticky previous-prompt preview (default: false)
-# pin_todos = false
+# pin_todos = true
 
 # Wrap long lines in the pinned diff pane (default: true)
 # Set to false for horizontal scrolling instead of wrapping
@@ -657,9 +657,10 @@ desktop_notifications = true
 # [sponsors] # Legacy config section name retained for compatibility.
 # Integration discovery (enabled by default; set enabled = false to opt out).
 # When enabled, the agent gains a `discover_tools` tool listing third-party
-# developer tools from Jcode's hosted integration directory. Some providers
+# developer tools from Jcode's hosted integration directory. These providers
+# have integrated with the agent to make setup and use seamless. Some providers
 # may share revenue with Jcode when a referred user becomes a customer, but
-# partnership status never influences recommendations.
+# commercial relationships never influence recommendations.
 # See https://jcode.sh/discovery-tools
 # enabled = true
 # endpoint = "https://api.jcode.sh/v1/discovery"

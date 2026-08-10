@@ -18,6 +18,7 @@ mod gmail;
 mod goal;
 pub mod inflight;
 mod invalid;
+mod jcode_docs;
 mod ls;
 pub mod mcp;
 mod memory;
@@ -44,6 +45,10 @@ use jcode_message_types::ToolDefinition;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
+    allowed.contains(name) || (allowed.contains("mcp") && name.starts_with("mcp__"))
+}
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
@@ -237,6 +242,12 @@ impl Registry {
                 websearch::WebSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "jcode_docs",
+                jcode_docs::JcodeDocsTool::new,
+            );
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
@@ -316,7 +327,7 @@ impl Registry {
             "conversation_search",
             conversation_search::ConversationSearchTool::new(compaction),
         );
-        // Sponsored discovery is on by default (opt-out); when disabled the
+        // Integration discovery is on by default (opt-out); when disabled the
         // tool is never registered and no discovery endpoint is ever
         // contacted.
         if crate::config::config().sponsors.enabled {
@@ -352,7 +363,11 @@ impl Registry {
         let tools = self.tools.read().await;
         let mut defs: Vec<ToolDefinition> = tools
             .iter()
-            .filter(|(name, _)| allowed_tools.map(|set| set.contains(*name)).unwrap_or(true))
+            .filter(|(name, _)| {
+                allowed_tools
+                    .map(|set| tool_name_is_allowed(set, name))
+                    .unwrap_or(true)
+            })
             .map(|(name, tool)| {
                 let mut def = tool.to_definition();
                 // Use registry key as the tool name (important for MCP tools where
@@ -626,7 +641,7 @@ impl Registry {
         let resolved_name = Self::resolve_tool_name(name);
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
-                && !allowed.contains(resolved_name)
+                && !tool_name_is_allowed(allowed, resolved_name)
             {
                 return Err(anyhow::anyhow!("Tool '{}' is not allowed", resolved_name));
             }
@@ -1247,6 +1262,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[b.len()]
+}
+
+#[cfg(test)]
+mod mcp_allow_list_tests {
+    use super::tool_name_is_allowed;
+    use std::collections::HashSet;
+
+    #[test]
+    fn allowing_mcp_also_allows_dynamic_server_tools() {
+        let allowed = HashSet::from(["mcp".to_string()]);
+
+        assert!(tool_name_is_allowed(&allowed, "mcp"));
+        assert!(tool_name_is_allowed(&allowed, "mcp__filesystem__read_file"));
+        assert!(!tool_name_is_allowed(&allowed, "mcpish"));
+        assert!(!tool_name_is_allowed(&allowed, "bash"));
+    }
 }
 
 #[cfg(test)]

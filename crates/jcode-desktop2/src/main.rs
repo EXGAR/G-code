@@ -98,7 +98,7 @@ struct App {
     state: Option<render::RenderState>,
     painter: paint::Painter,
     model: Model,
-    harness: Option<(Receiver<harness::HarnessUpdate>, Sender<harness::Command>)>,
+    harness: Option<(Receiver<harness::HarnessUpdate>, harness::CommandSender)>,
     /// Latest modifier state; winit reports it separately from key events.
     modifiers: winit::keyboard::ModifiersState,
     /// When Super went down with nothing else pressed since, or `None` when
@@ -1790,6 +1790,18 @@ impl App {
                     self.model.set_notice("zoom 100%");
                 } else {
                     self.model.set_notice("zoom limit reached");
+                }
+            }
+
+            Action::PanelShrink | Action::PanelGrow => {
+                let grow = matches!(action, Action::PanelGrow);
+                if self.model.workspace.resize_column(grow) {
+                    self.model.set_notice(format!(
+                        "session panel {}%",
+                        self.model.workspace.column_percent()
+                    ));
+                } else {
+                    self.model.set_notice("session panel size limit reached");
                 }
             }
 
