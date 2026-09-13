@@ -66,6 +66,9 @@ impl App {
     }
 
     fn configured_remote_provider_hint(&self) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return None;
+        }
         std::env::var("JCODE_PROVIDER")
             .ok()
             .or_else(|| crate::config::config().provider.default_provider.clone())
@@ -74,6 +77,9 @@ impl App {
     }
 
     fn configured_remote_model_hint(&self) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return None;
+        }
         Self::sanitize_remote_model_hint(
             std::env::var("JCODE_MODEL")
                 .ok()
@@ -82,6 +88,9 @@ impl App {
     }
 
     pub(super) fn effective_remote_provider_model(&self) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return Self::sanitize_remote_model_hint(self.remote_provider_model.clone());
+        }
         Self::sanitize_remote_model_hint(self.remote_provider_model.clone())
             .or_else(|| Self::sanitize_remote_model_hint(self.session.model.clone()))
             .or_else(|| self.configured_remote_model_hint())
@@ -110,6 +119,9 @@ impl App {
     /// reported one yet, so pre-settle effort cycling starts from the value the
     /// session will actually use instead of assuming the maximum.
     pub(super) fn remote_reasoning_effort_hint(&self) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return self.remote_reasoning_effort.clone();
+        }
         self.remote_reasoning_effort.clone().or_else(|| {
             let (provider, model) = self.remote_effort_identity();
             let provider = provider.unwrap_or_default().to_ascii_lowercase();
@@ -589,6 +601,14 @@ impl crate::tui::TuiState for App {
         self.pinned_todos_payload_ref()
     }
 
+    fn pinned_todos_expanded(&self) -> bool {
+        self.pinned_todos_expanded
+    }
+
+    fn background_task_rows(&self) -> &[crate::tui::BackgroundTaskRow] {
+        self.background_task_rows_ref()
+    }
+
     fn input(&self) -> &str {
         &self.input
     }
@@ -687,6 +707,9 @@ impl crate::tui::TuiState for App {
     }
 
     fn available_skills(&self) -> Vec<String> {
+        if crate::tui::is_ssh_remote() {
+            return self.remote_skills.clone();
+        }
         if self.is_remote && !self.remote_skills.is_empty() {
             self.remote_skills.clone()
         } else {
@@ -880,6 +903,9 @@ impl crate::tui::TuiState for App {
     }
 
     fn server_display_name(&self) -> Option<String> {
+        if let Some(host) = crate::tui::ssh_remote_host() {
+            return Some(format!("SSH {host}"));
+        }
         self.remote_server_short_name.clone().or_else(|| {
             if !self.is_remote {
                 return None;
@@ -1334,8 +1360,6 @@ impl crate::tui::TuiState for App {
             }
         });
 
-        let memory_info = gather_memory_info(self.memory_enabled, self.session.working_dir.clone());
-
         // Gather swarm info
         let swarm_info = if self.swarm_enabled {
             let subagent_status = self.subagent_status.clone();
@@ -1589,10 +1613,13 @@ impl crate::tui::TuiState for App {
             session_name,
             working_dir: self.session.working_dir.clone(),
             client_count,
-            memory_info,
+            // Memory remains available through commands and tools, but no longer
+            // occupies a dedicated info widget.
+            memory_info: None,
             swarm_info,
             background_info,
             usage_info,
+            usage_display_used: crate::config::config().display.usage_display_used(),
             tokens_per_second,
             provider_name: if uses_remote_widget_metadata {
                 self.remote_provider_name
@@ -1653,6 +1680,10 @@ impl crate::tui::TuiState for App {
     }
 
     fn auth_status(&self) -> crate::auth::AuthStatus {
+        if crate::tui::is_ssh_remote() {
+            // Host-local credentials say nothing about the remote provider.
+            return crate::auth::AuthStatus::default();
+        }
         // Render path: never pay a cold credential probe on the frame thread.
         // A TTL lapse serves the previous snapshot and refreshes in the
         // background; the auth generation bump repaints the header when the
@@ -1812,6 +1843,9 @@ impl crate::tui::TuiState for App {
     }
     fn side_panel_image_zoom_percent(&self) -> u8 {
         self.side_panel_image_zoom_percent
+    }
+    fn panel_image_preview(&self) -> Option<u64> {
+        self.panel_image_preview
     }
     fn diff_pane_focus(&self) -> bool {
         self.diff_pane_focus
@@ -2158,6 +2192,11 @@ pub(crate) fn swarm_panel_action_for_key(
     // macOS Option+letter often arrives as a transformed glyph with no ALT
     // modifier; normalize through the shared shortcut helper.
     let macos_letter = crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    let macos_shift_letter =
+        crate::tui::keybind::shortcut_char_for_macos_option_shift_key(code, modifiers);
+    if macos_shift_letter == Some('p') {
+        return Some(SwarmPanelAction::OpenPrompt);
+    }
     match code {
         KeyCode::Down | KeyCode::Char('j') if alt => Some(SwarmPanelAction::SelectNext),
         KeyCode::Up | KeyCode::Char('k') if alt => Some(SwarmPanelAction::SelectPrev),

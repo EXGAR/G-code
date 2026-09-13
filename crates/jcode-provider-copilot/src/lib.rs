@@ -253,6 +253,7 @@ mod tests {
 
     fn swarm_shaped_tool() -> ToolDefinition {
         ToolDefinition {
+            execution_mode: None,
             name: "swarm".to_string(),
             description: "Coordinate agents".to_string(),
             input_schema: json!({

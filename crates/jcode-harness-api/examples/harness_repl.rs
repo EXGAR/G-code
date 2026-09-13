@@ -59,6 +59,7 @@ fn run_session<R: BufRead, W: Write>(mut client: HarnessClient<R, W>, message: &
             session_id: session_id.clone(),
             content: message.to_string(),
             images: vec![],
+            system_reminder: None,
             no_reply: false,
         })
         .expect("send message");
@@ -116,11 +117,17 @@ fn run_demo() {
                     id,
                     ApiEvent::Attached {
                         session: jcode_harness_api::SessionInfo {
+                            parent_session_id: None,
+                            agent_label: None,
+                            swarm_status: None,
                             session_id: "demo-1".into(),
                             working_dir: None,
                             title: Some("demo".into()),
                             status: "idle".into(),
                             transcript_bytes: None,
+                            saved: false,
+                            updated_at_ms: None,
+                            last_active_at_ms: None,
                             archived: false,
                             archived_at_ms: None,
                         },

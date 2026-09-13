@@ -237,7 +237,7 @@ pub fn build_responses_input_with_logger(
                             id,
                             summary,
                             encrypted_content,
-                            status,
+                            ..
                         } => {
                             let mut item = serde_json::json!({
                                 "type": "reasoning",
@@ -252,9 +252,6 @@ pub fn build_responses_input_with_logger(
                             });
                             if let Some(encrypted_content) = encrypted_content {
                                 item["encrypted_content"] = serde_json::json!(encrypted_content);
-                            }
-                            if let Some(status) = status {
-                                item["status"] = serde_json::json!(status);
                             }
                             items.push(item);
                         }
@@ -567,6 +564,7 @@ mod tests {
     #[test]
     fn build_tools_flattens_allof_schema_for_openai() {
         let defs = vec![ToolDefinition {
+            execution_mode: None,
             name: "read".to_string(),
             description: "Read params".to_string(),
             input_schema: json!({
@@ -631,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn build_responses_input_replays_openai_reasoning_item() {
+    fn build_responses_input_replays_openai_reasoning_without_output_only_status() {
         let messages = vec![ChatMessage {
             role: Role::Assistant,
             content: vec![ContentBlock::OpenAIReasoning {
@@ -650,7 +648,7 @@ mod tests {
         assert_eq!(items[0]["type"], json!("reasoning"));
         assert_eq!(items[0]["id"], json!("rs_123"));
         assert_eq!(items[0]["encrypted_content"], json!("enc_reasoning"));
-        assert_eq!(items[0]["status"], json!("completed"));
+        assert!(items[0].get("status").is_none());
         assert_eq!(
             items[0]["summary"],
             json!([{ "type": "summary_text", "text": "Checked constraints." }])
@@ -668,6 +666,7 @@ mod tests {
     fn build_tools_strips_unique_items_from_the_request_payload() {
         // The reporter's MCP schema (@tubealfred/mcp youtube_*_batch).
         let defs = vec![ToolDefinition {
+            execution_mode: None,
             name: "mcp__tubealfred__youtube_channels_batch".to_string(),
             description: "Batch fetch channels".to_string(),
             input_schema: json!({

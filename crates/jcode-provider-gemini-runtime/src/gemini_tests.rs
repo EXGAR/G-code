@@ -448,6 +448,7 @@ fn build_contents_normalizes_non_object_tool_call_args_for_gemini_struct() {
 #[test]
 fn build_tools_uses_function_declarations() {
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "read".to_string(),
         description: "Read a file".to_string(),
         input_schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
@@ -471,6 +472,7 @@ fn schema_contains_key(schema: &Value, key: &str) -> bool {
 #[test]
 fn build_tools_rewrites_const_for_gemini_schema_compatibility() {
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "batch".to_string(),
         description: "Batch tools".to_string(),
         input_schema: json!({
@@ -515,6 +517,7 @@ fn build_tools_strips_additional_properties_for_gemini_schema_compatibility() {
     // (and other draft-JSON-Schema keywords) with HTTP 400, so build_tools must
     // strip them recursively while preserving the rest of the schema.
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "read".to_string(),
         description: "Reads a file".to_string(),
         input_schema: json!({
@@ -836,6 +839,7 @@ fn build_tools_prunes_required_names_not_defined_in_the_same_object() {
     // ("required fields ['label'] are not defined in the schema properties"),
     // which broke every tool-enabled request (issue #655).
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "swarm".to_string(),
         description: "Coordinate agents".to_string(),
         input_schema: json!({
@@ -873,6 +877,7 @@ fn build_tools_prunes_required_names_not_defined_in_the_same_object() {
 #[test]
 fn build_tools_drops_a_required_array_left_empty_after_pruning() {
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "noop".to_string(),
         description: "noop".to_string(),
         input_schema: json!({
@@ -895,6 +900,7 @@ fn build_tools_keeps_required_when_the_object_declares_no_properties() {
     // Without a local `properties` map there is nothing to validate against, and
     // Gemini does not reject it, so leave such schemas untouched.
     let defs = vec![ToolDefinition {
+        execution_mode: None,
         name: "passthrough".to_string(),
         description: "passthrough".to_string(),
         input_schema: json!({

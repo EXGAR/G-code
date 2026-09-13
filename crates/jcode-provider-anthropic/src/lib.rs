@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 /// Claude Code billing attribution text observed in the official CLI's system
 /// prompt blocks.
-pub const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;";
+pub const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.257; cc_entrypoint=sdk-cli; cch=33f85;";
 
 const CLAUDE_CODE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
@@ -1046,6 +1046,7 @@ mod cache_prefix_invariant_tests {
 
     fn tool_def(name: &str) -> ToolDefinition {
         ToolDefinition {
+            execution_mode: None,
             name: name.to_string(),
             description: format!("{name} description"),
             input_schema: json!({"type":"object","properties":{}}),
@@ -1055,6 +1056,7 @@ mod cache_prefix_invariant_tests {
     #[test]
     fn format_tools_removes_top_level_combinators_for_anthropic_api() {
         let tool = ToolDefinition {
+            execution_mode: None,
             name: "custom".to_string(),
             description: "schema compatibility regression".to_string(),
             input_schema: json!({

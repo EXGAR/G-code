@@ -15,6 +15,7 @@ pub mod selection;
 pub mod transport;
 
 pub use transport::is_transient_transport_error;
+pub use jcode_usage_types::{ModelUsage, compare_model_usage};
 
 pub use anthropic::{
     ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,
@@ -74,6 +75,12 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 /// Provider trait for LLM backends.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Prepare provider-specific request state before the foreground completion.
+    ///
+    /// The default is intentionally a no-op. Implementations must not send user
+    /// input through this hook or wait for a network warmup to finish.
+    async fn prewarm(&self, _tools: &[ToolDefinition], _system_static: &str) {}
+
     /// Send messages and get a streaming response.
     /// resume_session_id: Optional session ID to resume a previous conversation (provider-specific).
     async fn complete(
@@ -681,6 +688,8 @@ pub struct ModelRoute {
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cheapness: Option<RouteCheapnessEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<jcode_usage_types::ModelUsage>,
 }
 
 /// Exact runtime identity for a selected model route.
@@ -1572,6 +1581,7 @@ mod tests {
                 api_method: "snapshot-api".to_string(),
                 available: true,
                 detail: "test route".to_string(),
+                usage: None,
                 cheapness: None,
             }]
         }
@@ -1617,6 +1627,7 @@ mod tests {
             api_method: "openrouter".to_string(),
             available: true,
             detail: "https://openrouter.ai/api/v1".to_string(),
+            usage: None,
             cheapness: None,
         });
         assert_eq!(selection.model, "openrouter/owl-alpha");
@@ -1629,6 +1640,7 @@ mod tests {
             api_method: "openai-compatible:nvidia-nim".to_string(),
             available: true,
             detail: "https://integrate.api.nvidia.com/v1".to_string(),
+            usage: None,
             cheapness: None,
         });
         assert_eq!(

@@ -198,7 +198,30 @@ impl App {
         else {
             return false;
         };
-        self.cycle_image_expand(image_id);
+        let level = self.cycle_image_expand(image_id);
+        let size = match level {
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Fit => "fit",
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Large => "large",
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Full => "full",
+        };
+        crate::tui::mermaid::set_mermaid_inline_expand_level(image_id, level as u8);
+        if let Some(source) = crate::tui::mermaid::mermaid_source_for_hash(image_id) {
+            let copied = super::helpers::copy_to_clipboard(&source);
+            self.set_status_notice(if copied {
+                format!("Image size: {size} · Mermaid code copied")
+            } else {
+                format!("Image size: {size} · Could not copy Mermaid code")
+            });
+        } else if let Some((media_type, data)) =
+            super::super::ui::inline_image_ui::payload_for_copy(image_id)
+        {
+            let copied = super::helpers::copy_image_to_clipboard(&media_type, &data);
+            self.set_status_notice(if copied {
+                format!("Image size: {size} · Image copied")
+            } else {
+                format!("Image size: {size} · Could not copy image")
+            });
+        }
         true
     }
 
@@ -257,6 +280,9 @@ impl App {
     }
 
     pub(super) fn try_open_repository_markdown_link(&mut self, target: &str) -> bool {
+        if crate::tui::is_ssh_remote() {
+            return false;
+        }
         let path_target = target.split(['#', '?']).next().unwrap_or(target);
         let relative = std::path::Path::new(path_target);
         if relative.is_absolute()
@@ -504,6 +530,11 @@ impl App {
             .diff_pane_scroll_x
             .saturating_add(dx)
             .clamp(-4096, 4096);
+    }
+
+    pub(super) fn close_panel_image_preview(&mut self) {
+        self.panel_image_preview = None;
+        crate::tui::mermaid::clear_image_state();
     }
 
     pub(super) fn adjust_side_panel_image_zoom(&mut self, delta_percent: i16) {
@@ -1048,7 +1079,9 @@ impl App {
             .get(&image_id)
             .copied()
             .unwrap_or_default();
-        let next = current.next();
+        let next = ImageExpandLevel::from_index(
+            crate::tui::mermaid::next_distinct_mermaid_inline_level(image_id, current as u8),
+        );
         if matches!(next, ImageExpandLevel::Fit) {
             self.expanded_images.remove(&image_id);
         } else {
@@ -1335,6 +1368,13 @@ impl App {
             }};
         }
 
+        if self.panel_image_preview.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.close_panel_image_preview();
+            }
+            finish_mouse_event!(false, "panel_image_preview");
+        }
+
         if self.changelog_scroll.is_some() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -1484,6 +1524,15 @@ impl App {
             self.set_diff_pane_focus(false);
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && crate::tui::ui::viewport::pinned_todo_more_area().is_some_and(|area| {
+                super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
+            })
+        {
+            self.pinned_todos_expanded = true;
+            finish_mouse_event!(false, "pinned_todos_expand");
+        }
+
         // A left press in the composer moves the caret first (native text-field
         // behavior), then falls through so the shared copy-selection machinery
         // can arm a drag anchor: click repositions the cursor, drag selects the
@@ -1578,7 +1627,9 @@ impl App {
                 }
                 self.set_diagram_focus(true);
                 handled_scroll = true;
-            } else if self.diagram_focus {
+            } else {
+                // Wheel input belongs to the pane under the pointer, even while
+                // keyboard focus stays in chat. Do not fall through at pan limits.
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.pan_diagram(0, -1),
                     MouseEventKind::ScrollDown => self.pan_diagram(0, 1),
@@ -1633,7 +1684,16 @@ impl App {
         }
 
         if handled_scroll {
-            finish_mouse_event!(!immediate_redraw, "pane_or_focused_diagram_scroll");
+            finish_mouse_event!(!immediate_redraw, "hovered_pane_scroll");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let Some(hash) =
+                crate::tui::ui::panel_image_preview::image_at(mouse.column, mouse.row)
+        {
+            self.panel_image_preview = Some(hash);
+            crate::tui::mermaid::clear_image_state();
+            finish_mouse_event!(false, "open_panel_image_preview");
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
@@ -1646,6 +1706,27 @@ impl App {
             && self.try_toggle_swarm_expand_at(mouse.column, mouse.row)
         {
             finish_mouse_event!(false, "toggle_swarm_expand");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && crate::tui::ui::visible_expand_edit_badge_at(mouse.column, mouse.row)
+            && super::input::handle_expand_edit_badge_shortcut(self, 'e')
+        {
+            finish_mouse_event!(false, "expand_edit_badge_click");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let Some(target) = crate::tui::ui::visible_copy_target_at(mouse.column, mouse.row)
+        {
+            let success = super::helpers::copy_to_clipboard(&target.content);
+            self.record_copy_badge_key_press(target.key);
+            self.record_copy_badge_feedback(target.key, success);
+            if success {
+                self.set_status_notice(target.copied_notice);
+            } else {
+                self.set_status_notice(format!("Failed to copy {}", target.kind_label));
+            }
+            finish_mouse_event!(false, "copy_badge_click");
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))

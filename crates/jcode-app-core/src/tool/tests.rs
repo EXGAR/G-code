@@ -1,10 +1,34 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::*;
+
 use crate::message::{Message, ToolDefinition};
 use crate::provider::{EventStream, Provider};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::ffi::OsString;
+
+struct TestHomeGuard {
+    previous: Option<OsString>,
+}
+
+impl TestHomeGuard {
+    fn new(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", path);
+        Self { previous }
+    }
+}
+
+impl Drop for TestHomeGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            crate::env::set_var("JCODE_HOME", previous);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+}
 
 struct MockProvider;
 
@@ -31,6 +55,120 @@ impl Provider for MockProvider {
     }
 }
 
+fn mcp_test_context(working_dir: &std::path::Path) -> ToolContext {
+    ToolContext {
+        session_id: "mcp-registry-lifetime".to_string(),
+        message_id: "message".to_string(),
+        tool_call_id: "mcp-call".to_string(),
+        working_dir: Some(working_dir.to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    }
+}
+
+async fn register_empty_mcp_tools(registry: &Registry, working_dir: &std::path::Path) {
+    let pool = Arc::new(crate::mcp::SharedMcpPool::new(
+        crate::mcp::McpConfig::default(),
+    ));
+    registry
+        .register_mcp_tools_for_dir(
+            None,
+            Some(pool),
+            Some("mcp-registry-lifetime".to_string()),
+            Some(working_dir.to_path_buf()),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn real_mcp_registration_does_not_retain_registry_tool_map() {
+    let _env_lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("create isolated JCODE_HOME");
+    let _home_guard = TestHomeGuard::new(home.path());
+    let working_dir = tempfile::tempdir().expect("create isolated MCP working directory");
+    let registry = Registry::empty();
+    let tools = Arc::downgrade(&registry.tools);
+
+    register_empty_mcp_tools(&registry, working_dir.path()).await;
+    assert!(registry.tool_names().await.iter().any(|name| name == "mcp"));
+
+    drop(registry);
+
+    assert!(
+        tools.upgrade().is_none(),
+        "McpManagementTool must not strongly retain the registry tool map that owns it"
+    );
+}
+
+#[tokio::test]
+async fn mcp_management_upgrades_registry_through_surviving_clone() {
+    let _env_lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("create isolated JCODE_HOME");
+    let _home_guard = TestHomeGuard::new(home.path());
+    let working_dir = tempfile::tempdir().expect("create isolated MCP working directory");
+    let registry = Registry::empty();
+    let tools = Arc::downgrade(&registry.tools);
+
+    register_empty_mcp_tools(&registry, working_dir.path()).await;
+    let surviving_clone = registry.clone();
+    drop(registry);
+
+    let stale_tool = surviving_clone
+        .tools
+        .read()
+        .await
+        .get("mcp")
+        .cloned()
+        .expect("MCP management tool should be registered");
+    surviving_clone
+        .register("mcp__lifetime__sentinel".to_string(), stale_tool)
+        .await;
+
+    let output = surviving_clone
+        .execute(
+            "mcp",
+            serde_json::json!({"action": "reload"}),
+            mcp_test_context(working_dir.path()),
+        )
+        .await
+        .expect("MCP management should upgrade through the surviving registry clone");
+    assert!(output.output.contains("No servers found in config"));
+    assert!(
+        !surviving_clone
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "mcp__lifetime__sentinel"),
+        "reload should mutate the surviving registry through the weak handle"
+    );
+    assert!(
+        surviving_clone
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "mcp"),
+        "reload should preserve the MCP management tool"
+    );
+    assert!(tools.upgrade().is_some());
+
+    drop(surviving_clone);
+    assert!(tools.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn maintainer_feedback_tool_is_registered() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    assert!(
+        registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "maintainer_feedback")
+    );
+}
+
 #[tokio::test]
 async fn test_tool_definitions_are_sorted() {
     // Create registry with mock provider
@@ -55,6 +193,47 @@ async fn test_tool_definitions_are_sorted() {
         names, sorted_names,
         "Tool definitions should be sorted alphabetically"
     );
+}
+
+#[test]
+fn deferred_mcp_surfaces_follow_umbrella_and_per_tool_filters() {
+    use std::collections::HashSet;
+
+    let umbrella = HashSet::from(["mcp".to_string()]);
+    assert!(super::tool_name_is_allowed(&umbrella, "mcp_search"));
+    assert!(super::tool_name_is_allowed(&umbrella, "mcp_call"));
+    assert!(super::tool_name_is_allowed(&umbrella, "mcp__server__tool"));
+
+    let one_tool = HashSet::from(["mcp__server__allowed".to_string()]);
+    assert!(super::tool_name_is_allowed(&one_tool, "mcp_search"));
+    assert!(super::tool_name_is_allowed(&one_tool, "mcp_call"));
+
+    let disabled = HashSet::from(["mcp".to_string()]);
+    assert!(super::tool_name_is_disabled(&disabled, "mcp_search"));
+    assert!(super::tool_name_is_disabled(&disabled, "mcp_call"));
+    assert!(super::tool_name_is_disabled(&disabled, "mcp__server__tool"));
+
+    super::set_session_tool_policy(
+        "deferred-filter-test",
+        Some(one_tool),
+        HashSet::from(["mcp__server__blocked".to_string()]),
+    );
+    assert!(super::session_mcp_dispatch_is_allowed(
+        "deferred-filter-test",
+        "mcp__server__allowed",
+        "mcp_call"
+    ));
+    assert!(!super::session_mcp_dispatch_is_allowed(
+        "deferred-filter-test",
+        "mcp__server__blocked",
+        "mcp_call"
+    ));
+    assert!(!super::session_mcp_dispatch_is_allowed(
+        "deferred-filter-test",
+        "mcp__server__other",
+        "mcp_call"
+    ));
+    super::clear_session_tool_policy("deferred-filter-test");
 }
 
 #[test]

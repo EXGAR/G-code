@@ -228,6 +228,39 @@ fn test_classify_openai_limits_recognizes_five_weekly_and_spark() {
 }
 
 #[test]
+fn test_classify_openai_limits_does_not_duplicate_weekly_window() {
+    let limits = vec![
+        UsageLimit {
+            name: "Codex weekly".to_string(),
+            usage_percent: 25.0,
+            resets_at: Some("2026-01-07T00:00:00Z".to_string()),
+        },
+        UsageLimit {
+            name: "Codex 7-day window".to_string(),
+            usage_percent: 50.0,
+            resets_at: Some("2026-01-14T00:00:00Z".to_string()),
+        },
+    ];
+
+    let classified = openai_helpers::classify_openai_limits(&limits);
+
+    assert_eq!(
+        classified
+            .seven_day
+            .as_ref()
+            .map(|window| window.name.as_str()),
+        Some("Codex weekly")
+    );
+    assert_eq!(
+        classified
+            .five_hour
+            .as_ref()
+            .map(|window| window.name.as_str()),
+        Some("Codex 7-day window")
+    );
+}
+
+#[test]
 fn test_parse_usage_percent_supports_used_limit_shape() {
     let mut obj = serde_json::Map::new();
     obj.insert("used".to_string(), serde_json::json!(20));
@@ -799,4 +832,51 @@ fn anthropic_model_scoped_exhaustion_matches_display_name_to_catalog_id() {
         ..Default::default()
     };
     assert!(!below_limit.model_scoped_exhausted("claude-fable-5"));
+}
+
+#[test]
+fn attach_activity_refreshes_openai_oauth_totals_even_on_error() {
+    let label = "test-usage-summary-no-account";
+    let mut report = ProviderUsage {
+        provider_name: "OpenAI".into(),
+        error: Some("quota request unavailable".into()),
+        extra_info: vec![("Plan".into(), "Plus".into())],
+        ..Default::default()
+    };
+    let expected = crate::provider_activity::openai_oauth_usage_summary(label);
+    assert!(!expected.is_empty());
+    for (key, _) in &expected {
+        report
+            .extra_info
+            .push((key.clone(), "stale cached value".into()));
+    }
+    for _ in 0..2 {
+        attach_activity(&mut report, &format!("openai:oauth:{label}"));
+        for row in &expected {
+            assert!(report.extra_info.contains(row));
+            assert_eq!(
+                report
+                    .extra_info
+                    .iter()
+                    .filter(|(key, _)| key == &row.0)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            report
+                .extra_info
+                .contains(&("Account label".into(), label.into()))
+        );
+        assert!(report.extra_info.contains(&("Plan".into(), "Plus".into())));
+        assert!(report.error.is_some());
+    }
+    let mut api_report = ProviderUsage::default();
+    attach_activity(&mut api_report, "openai:api:test-key");
+    assert!(
+        !api_report
+            .extra_info
+            .iter()
+            .any(|(key, _)| key == "Account label")
+    );
 }

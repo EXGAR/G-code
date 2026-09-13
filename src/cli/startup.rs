@@ -18,6 +18,28 @@ fn sync_output_style_from_config() {
 }
 
 pub async fn run() -> Result<()> {
+    // Parse once, before startup side effects. Invalid arguments and --help
+    // must not harden credential files or create configuration/telemetry state.
+    let raw_args = std::env::args_os().collect();
+    let rewritten_args = provider_arg_rewrite::rewrite_named_provider_args(
+        raw_args,
+        |value| ProviderChoice::from_str(value, false).is_ok(),
+        |value| crate::config::config().providers.contains_key(value),
+    );
+    let args = Args::parse_from(rewritten_args);
+    // Credential import must refuse existing stores without normal startup
+    // hardening, migrations, telemetry, or provider discovery touching them.
+    if args.ssh.is_none()
+        && matches!(
+            args.command,
+            Some(Command::Auth(super::args::AuthCommand::Import { .. }))
+        )
+    {
+        if let Some(cwd) = &args.cwd {
+            std::env::set_current_dir(cwd)?;
+        }
+        return dispatch::run_main(args).await;
+    }
     startup_profile::init();
 
     terminal::install_panic_hook();
@@ -115,11 +137,17 @@ pub async fn run() -> Result<()> {
     perf::init_background();
     startup_profile::mark("perf_init");
 
-    telemetry::record_install_if_first_run();
-    telemetry::record_upgrade_if_needed();
+    // Telemetry settings commands must run before they can cause telemetry. In
+    // particular, a first-ever `jcode telemetry disable` must not emit the
+    // install event that the command is trying to opt out of. Keep the normal
+    // startup ordering unchanged for every other invocation.
+    if !is_telemetry_subcommand_invocation(std::env::args_os()) {
+        telemetry::record_install_if_first_run();
+        telemetry::record_upgrade_if_needed();
+    }
     startup_profile::mark("telemetry_check");
 
-    let args = parse_and_prepare_args()?;
+    let args = parse_and_prepare_args(args)?;
     spawn_background_update_check(&args);
 
     if let Err(e) = dispatch::run_main(args).await {
@@ -130,11 +158,68 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+fn is_telemetry_subcommand_invocation(
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> bool {
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == std::ffi::OsStr::new("telemetry") {
+            return true;
+        }
+        let text = arg.to_string_lossy();
+        if !text.starts_with('-') {
+            return false;
+        }
+        if text == "--" {
+            return args
+                .next()
+                .is_some_and(|arg| arg.as_ref() == std::ffi::OsStr::new("telemetry"));
+        }
+        let option = text.split_once('=').map_or(text.as_ref(), |(name, _)| name);
+        let takes_separate_value = !text.contains('=')
+            && matches!(
+                option,
+                "-p" | "--provider"
+                    | "-C"
+                    | "--cwd"
+                    | "--remote-working-dir"
+                    | "--ssh"
+                    | "--ssh-binary"
+                    | "--ssh-server-socket"
+                    | "--spawn-hotkey"
+                    | "--socket"
+                    | "-m"
+                    | "--model"
+                    | "--provider-profile"
+                    | "--tool-profile"
+                    | "--mcp-tools"
+                    | "--mcp-tools-token-threshold"
+                    | "--tools"
+                    | "--disabled-tools"
+            );
+        if takes_separate_value && args.next().is_none() {
+            return false;
+        }
+    }
+    false
+}
+
 /// Register provider runtimes that live downstream of `jcode-base` with the
 /// base crate's external provider registry. Keep every downstream runtime
 /// registration in this one function so the composition-root wiring stays
 /// discoverable as more providers move out of the base crate.
 pub fn register_external_provider_runtimes() {
+    crate::provider::external::register_external_provider(
+        crate::provider::external::GROK_BUILD_RUNTIME,
+        || {
+            let mut process = jcode_provider_grok_build_runtime::GrokBuildProcess::from_env();
+            process.command = crate::auth::grok_build::cli_path();
+            std::sync::Arc::new(
+                jcode_provider_grok_build_runtime::GrokBuildProvider::with_process(process),
+            )
+        },
+    );
     crate::provider::external::register_external_provider(
         crate::provider::external::GEMINI_RUNTIME,
         || std::sync::Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new()),
@@ -218,14 +303,7 @@ pub fn register_external_provider_runtimes() {
     );
 }
 
-fn parse_and_prepare_args() -> Result<Args> {
-    let raw_args = std::env::args_os().collect();
-    let rewritten_args = provider_arg_rewrite::rewrite_named_provider_args(
-        raw_args,
-        |value| ProviderChoice::from_str(value, false).is_ok(),
-        |value| crate::config::config().providers.contains_key(value),
-    );
-    let args = Args::parse_from(rewritten_args);
+fn parse_and_prepare_args(args: Args) -> Result<Args> {
     startup_profile::mark("args_parse");
 
     if let Some(chord) = args.spawn_hotkey.as_deref() {
@@ -388,11 +466,23 @@ fn spawn_background_update_check(args: &Args) {
 }
 
 fn should_spawn_background_update_check(args: &Args) -> bool {
-    !args.quiet
+    should_spawn_background_update_check_with_config(
+        args,
+        crate::config::config().features.check_updates,
+    )
+}
+
+fn should_spawn_background_update_check_with_config(args: &Args, check_updates: bool) -> bool {
+    check_updates
+        && args.ssh.is_none()
+        && !args.quiet
         && !args.no_update
         && !matches!(
             args.command,
-            Some(Command::Update) | Some(Command::Serve { .. }) | Some(Command::Acp)
+            Some(Command::Update)
+                | Some(Command::Serve { .. })
+                | Some(Command::Server { .. })
+                | Some(Command::Acp)
         )
         && args.resume.is_none()
 }
@@ -421,6 +511,52 @@ mod tests {
 
     fn parse_args(argv: &[&str]) -> Args {
         Args::parse_from(argv)
+    }
+
+    #[test]
+    fn telemetry_subcommand_skips_startup_telemetry() {
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "telemetry",
+            "disable"
+        ]));
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "--no-update",
+            "telemetry",
+            "disable"
+        ]));
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "--provider",
+            "openai",
+            "telemetry",
+            "disable"
+        ]));
+    }
+
+    #[test]
+    fn telemetry_prompt_does_not_skip_normal_startup_telemetry() {
+        assert!(!is_telemetry_subcommand_invocation([
+            "jcode",
+            "run",
+            "telemetry"
+        ]));
+    }
+
+    #[test]
+    fn parses_mcp_tool_exposure_flags() {
+        let args = parse_args(&[
+            "jcode",
+            "--mcp-tools",
+            "deferred",
+            "--mcp-tools-token-threshold",
+            "4321",
+            "run",
+            "hello",
+        ]);
+        assert_eq!(args.mcp_tools.as_deref(), Some("deferred"));
+        assert_eq!(args.mcp_tools_token_threshold, Some(4_321));
     }
 
     #[test]
@@ -462,6 +598,17 @@ mod tests {
         assert!(matches!(args.command, Some(Command::Update)));
         assert!(!should_spawn_background_update_check(&args));
         assert!(should_auto_install_update(&args));
+    }
+
+    #[test]
+    fn config_can_permanently_disable_background_update_checks() {
+        let args = parse_args(&["jcode", "login"]);
+        assert!(should_spawn_background_update_check_with_config(
+            &args, true
+        ));
+        assert!(!should_spawn_background_update_check_with_config(
+            &args, false
+        ));
     }
 
     #[test]

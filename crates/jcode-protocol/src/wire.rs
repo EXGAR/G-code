@@ -45,6 +45,10 @@ pub enum Request {
         images: Vec<(String, String)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_reminder: Option<String>,
+        /// Skill selected by the client for this and subsequent turns. The
+        /// daemon resolves the name against its own skill registry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_skill: Option<String>,
         /// Append the user message as context only. The daemon persists it and
         /// acknowledges it without starting a model turn.
         #[serde(default, skip_serializing_if = "is_false")]
@@ -128,6 +132,17 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_session_takeover: bool,
+        /// Legacy ownership hint, retained for wire compatibility. Disconnects
+        /// only mark a session crashed when they interrupt unfinished processing,
+        /// regardless of this flag. Idle/completed sessions close normally.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        crash_on_disconnect: bool,
+        /// Keep an already-running turn alive when this transport disconnects.
+        /// Opt-in for remote clients only. Idle sessions still close normally,
+        /// and reattachment uses persisted history plus future live events, not
+        /// replay of missed deltas. This does not survive daemon termination.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        continue_on_disconnect: bool,
         /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
         /// from the connecting client so the server can route spawn/focus hooks
         /// to the client's terminal instead of its own stale startup env (#405).
@@ -135,13 +150,25 @@ pub enum Request {
         terminal_env: Vec<(String, String)>,
     },
 
+    /// Declare that this client is intentionally detaching before its transport
+    /// closes. Retained for compatibility with older servers that use
+    /// `crash_on_disconnect` for idle sessions too.
+    #[serde(rename = "prepare_disconnect")]
+    PrepareDisconnect { id: u64 },
+
     /// Get full conversation history (for TUI sync on connect)
     #[serde(rename = "get_history")]
     GetHistory { id: u64 },
 
     /// Get only provider/model metadata and available models.
     #[serde(rename = "get_model_catalog")]
-    GetModelCatalog { id: u64 },
+    GetModelCatalog {
+        id: u64,
+        /// Older clients cannot decode new event variants. Only clients that
+        /// explicitly opt in receive incremental model_usage_updated events.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        subscribe_usage_updates: bool,
+    },
 
     /// Get a bounded view of compacted historical messages for lazy transcript expansion.
     #[serde(rename = "get_compacted_history")]
@@ -728,6 +755,15 @@ pub enum Request {
     reason = "wire protocol prioritizes straightforward serde payloads over boxing every larger event variant"
 )]
 pub enum ServerEvent {
+    /// An autonomous wake was requested. In external wake mode this event is
+    /// emitted instead of starting or injecting into a turn.
+    #[serde(rename = "wake_requested")]
+    WakeRequested {
+        session_id: String,
+        reason: String,
+        notification: String,
+    },
+
     /// Acknowledgment of request
     #[serde(rename = "ack")]
     Ack { id: u64 },
@@ -1026,7 +1062,13 @@ pub enum ServerEvent {
 
     /// Pong response
     #[serde(rename = "pong")]
-    Pong { id: u64 },
+    Pong {
+        id: u64,
+        /// Native SSH protocol v1 supports opt-in disconnected turn continuation.
+        /// Omitted by older daemons, which a new SSH bridge must reject.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_ssh_protocol: Option<u32>,
+    },
 
     /// Current state (debug)
     #[serde(rename = "state")]
@@ -1260,6 +1302,10 @@ pub enum ServerEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// Usage delta for a route, independent of catalog availability or Agent locks.
+    #[serde(rename = "model_usage_updated")]
+    ModelUsageUpdated { route: jcode_provider_core::ModelRoute },
 
     /// Available models updated (pushed after auth changes)
     #[serde(rename = "available_models_updated")]

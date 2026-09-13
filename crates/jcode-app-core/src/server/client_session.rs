@@ -18,6 +18,7 @@ use crate::provider::Provider;
 use crate::tool::Registry;
 use crate::transport::WriteHalf;
 use anyhow::Result;
+use futures::FutureExt;
 use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -229,11 +230,12 @@ pub(super) async fn handle_clear_session(
     // `/clear` creates a genuinely fresh session. Do not migrate the old
     // session's swarm membership or plan participation to the replacement:
     // doing so lets a subsequent plan snapshot repopulate the cleared UI.
-    let swarm_id_for_update = {
+    let (swarm_id_for_update, swarm_enabled, friendly_name) = {
         let mut members = swarm_members.write().await;
-        members
-            .remove(client_session_id)
-            .and_then(|member| member.swarm_id)
+        match members.remove(client_session_id) {
+            Some(member) => (member.swarm_id, member.swarm_enabled, member.friendly_name),
+            None => (None, false, None),
+        }
     };
     if let Some(ref swarm_id) = swarm_id_for_update {
         let mut swarms = swarms_by_id.write().await;
@@ -249,6 +251,23 @@ pub(super) async fn handle_clear_session(
         client_session_id,
         channel_subscriptions,
         channel_subscriptions_by_session,
+    )
+    .await;
+    // The connection remains subscribed across `/clear`, so there is no later
+    // subscribe request to register the replacement session. Register it as a
+    // fresh root while deliberately leaving the old swarm and plan behind.
+    ensure_client_swarm_member(
+        &new_id,
+        client_connection_id,
+        &friendly_name,
+        client_event_tx,
+        agent,
+        swarm_enabled,
+        swarm_members,
+        swarms_by_id,
+        event_history,
+        event_counter,
+        swarm_event_tx,
     )
     .await;
     update_member_status(
@@ -880,6 +899,17 @@ pub(super) async fn handle_subscribe(
         session_id: client_session_id.to_string(),
     });
     let _ = client_event_tx.send(ServerEvent::Done { id });
+    prewarm_idle_agent(agent);
+}
+
+fn prewarm_idle_agent(agent: &Arc<Mutex<Agent>>) -> bool {
+    // Poll local preparation once, without holding the agent across a yield.
+    // If a registry/provider lock would wait, abandon this optional attempt.
+    // Only the provider's network task can outlive this call.
+    let Ok(guard) = agent.try_lock() else {
+        return false;
+    };
+    guard.prewarm_provider().now_or_never().is_some()
 }
 
 async fn subscribe_should_mark_ready(
@@ -1533,11 +1563,6 @@ pub(super) async fn handle_resume_session(
             );
             return Ok(Arc::clone(agent));
         }
-    }
-
-    {
-        let mut agent_guard = agent.lock().await;
-        agent_guard.mark_closed();
     }
 
     let (result, is_canary) = {

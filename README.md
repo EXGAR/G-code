@@ -14,8 +14,8 @@ The most intelligent harness
 
 <a href="https://trendshift.io/repositories/25042?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25042" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25042" alt="1jehuang/jcode | Trendshift" width="250" height="55"></a>
 
-<a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-memory-demo.mp4">
-  <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-memory-demo.webp" alt="jcode memory demonstration" width="800">
+<a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.mp4">
+  <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.webp" alt="jcode YC launch video" width="800">
 </a>
 
 <br>
@@ -44,6 +44,23 @@ irm https://jcode.sh/install.ps1 | iex
 
 Need Homebrew, source builds, provider setup, or want an agent to set it up for you?
 [Jump to detailed installation](#detailed-installation).
+
+### Updating
+
+Run `/update` in the TUI to download the latest stable release in the background
+and reload with your session preserved. From a terminal, use `jcode update`, then
+restart the client. Both commands use the same update policy, including for dev builds.
+
+Older or equal release versions are skipped. For a development build, Jcode also
+compares the running binary's Git commit with the release tag. Builds ahead of,
+identical to, or diverged from the release are preserved. If ancestry cannot be
+verified locally or through GitHub, the update stops rather than risking a downgrade.
+The displayed dev patch includes a commit-count offset, so it is not used as a
+release version comparison.
+
+This is the default `features.update_channel = "stable"` behavior. An explicit
+`"main"` channel still opts into source-branch updates. Use `/rebuild` or the
+self-dev build workflow to rebuild your own checkout.
 
 ---
 
@@ -339,6 +356,7 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 - **Azure OpenAI** (`jcode login --provider azure`)
 - **Alibaba Cloud Coding Plan** (`jcode login --provider alibaba-coding-plan`)
 - **Fireworks** (`jcode login --provider fireworks`)
+- **Novita AI** (`jcode login --provider novita`, API key)
 - **MiniMax** (`jcode login --provider minimax`)
 - **Meta Model API / Muse** (`jcode login --provider meta-muse`)
 - **LM Studio** (`jcode login --provider lmstudio`)
@@ -346,6 +364,10 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 - **Custom OpenAI-compatible endpoint** (`jcode login --provider openai-compatible`)
 
 For custom OpenAI-compatible endpoints, jcode now prompts for the API base and supports local localhost servers without requiring an API key.
+
+The native OpenAI providers use Responses WebSocket v2 with opportunistic
+background prewarming and HTTPS fallback. See [OpenAI WebSocket transport](docs/OPENAI_WEBSOCKET.md)
+for behavior, controls, and verification.
 
 ### Config-file setup for self-hosted endpoints and MCP
 
@@ -363,13 +385,14 @@ There are two ways to set one up:
   jcode login --provider <profile-id>
   # for example:
   jcode login --provider openrouter
+  jcode login --provider orcarouter
   jcode login --provider deepseek
   jcode login --provider opencode      # OpenCode Zen
   jcode login --provider moonshotai
   jcode login --provider meta-muse     # Meta Model API / Muse Spark
   ```
 
-  Built-in OpenAI-compatible profile ids include: `openrouter`, `deepseek`, `zai`, `kimi`, `moonshotai`, `meta-muse` (Meta Model API / Muse Spark), `opencode` (OpenCode Zen), `opencode-go`, `302ai`, `baseten`, `cortecs`, `huggingface`, `nebius`, `scaleway`, `stackit`, and `firmware`. Each profile only sets the endpoint and key variable; you still pick the model with `/model` (or `--model`). Run `jcode login` with no provider to see the interactive list.
+  Built-in OpenAI-compatible profile ids include: `openrouter`, `orcarouter`, `deepseek`, `zai`, `kimi`, `moonshotai`, `meta-muse` (Meta Model API / Muse Spark), `opencode` (OpenCode Zen), `opencode-go`, `302ai`, `baseten`, `cortecs`, `huggingface`, `nebius`, `scaleway`, `stackit`, and `firmware`. Each profile only sets the endpoint and key variable; you still pick the model with `/model` (or `--model`). Run `jcode login` with no provider to see the interactive list.
 
 - **Any other endpoint** — point jcode at an arbitrary OpenAI-compatible API (hosted or local) with `jcode login --provider openai-compatible` or the scriptable `jcode provider add` command described below.
 
@@ -448,11 +471,46 @@ base_url = "https://llm.example.com/v1"
 api_key_env = "JCODE_PROVIDER_MY_API_API_KEY"
 env_file = "provider-my-api.env"
 default_model = "my-model-id"
+# Optional: prevent model names such as `gpt-5-*` from automatically enabling
+# `reasoning_effort` on gateways that reject it.
+disable_reasoning_heuristics = true
 
 [[providers.my-api.models]]
 id = "my-model-id"
 context_window = 128000
+# Explicitly enable `/effort` and select this model's initial effort. Set
+# `reasoning = false` on an individual model to disable it instead.
+reasoning = true
+reasoning_effort = "high"
 ```
+
+Anthropic Messages-compatible gateways use the same named-profile surface with
+`type = "anthropic-compatible"`. The profile can select bearer, custom-header,
+or no authentication and attach gateway-specific headers to every request:
+
+```toml
+[provider]
+default_provider = "corp-claude"
+default_model = "claude-sonnet-4-6"
+
+[providers.corp-claude]
+type = "anthropic-compatible"
+base_url = "https://gateway.example.com/anthropic/v1"
+auth = "bearer"
+api_key_env = "CORP_CLAUDE_TOKEN"
+default_model = "claude-sonnet-4-6"
+
+[providers.corp-claude.headers]
+x-tenant-id = "tenant-42"
+
+[[providers.corp-claude.models]]
+id = "claude-sonnet-4-6"
+context_window = 200000
+```
+
+For direct environment-based configuration, `ANTHROPIC_BASE_URL` overrides the
+non-OAuth Messages endpoint and `ANTHROPIC_AUTH_TOKEN` is sent as a bearer token.
+Claude OAuth traffic always continues to use Anthropic's official endpoints.
 
 ##### Extra request-body fields (`extra_body`)
 
@@ -537,10 +595,16 @@ Example MCP config:
       "args": ["--root", "/workspace"],
       "env": {},
       "shared": true
+    },
+    "websearch": {
+      "command": "/path/to/slow-mcp-server",
+      "timeout_secs": 120
     }
   }
 }
 ```
+
+Each request to an MCP server (`tools/call`, `tools/list`, `initialize`) times out after 30 seconds by default. Set `timeout_secs` on a server whose tools legitimately run longer.
 
 For headless or SSH sessions, OAuth-style providers support `jcode login --provider <provider> --no-browser` (alias: `--headless`) so jcode prints the auth URL/QR and falls back to manual code or callback paste instead of trying to launch a local browser.
 
@@ -578,8 +642,8 @@ The above image is the first page of provider logins
 ### Supported provider
 
 - **Native / first-party style providers:** `claude`, `openai`, `copilot`, `gemini`, `azure`, `alibaba-coding-plan`
-- **Aggregator / compatibility providers:** `openrouter`, `openai-compatible`
-- **Additional provider integrations:** `opencode`, `opencode-go`, `zai` / `kimi`, `302ai`, `baseten`, `cortecs`, `deepseek`, `firmware`, `huggingface`, `moonshotai`, `nebius`, `scaleway`, `stackit`, `groq`, `mistral`, `perplexity`, `togetherai`, `deepinfra`, `fireworks`, `minimax`, `xai`, `lmstudio`, `ollama`, `chutes`, `cerebras`, `cursor`, `antigravity`, `google`
+- **Aggregator / compatibility providers:** `openrouter`, `orcarouter`, `openai-compatible`
+- **Additional provider integrations:** `opencode`, `opencode-go`, `zai` / `kimi`, `302ai`, `baseten`, `cortecs`, `deepseek`, `firmware`, `huggingface`, `moonshotai`, `nebius`, `scaleway`, `stackit`, `groq`, `mistral`, `perplexity`, `togetherai`, `deepinfra`, `fireworks`, `novita`, `minimax`, `xai`, `lmstudio`, `ollama`, `chutes`, `cerebras`, `cursor`, `antigravity`, `google`
 
 Jcode also supports easy multi-account switching. Ran out of tokens on your first ChatGPT Pro subscription? /account and quickly switch to your second. 
 
@@ -774,6 +838,7 @@ Set up jcode on this machine for me.
    - Azure OpenAI: `~/.config/jcode/azure-openai.env`, `AZURE_OPENAI_*`, or an existing `az login`
    - OpenRouter: `OPENROUTER_API_KEY`
    - Fireworks: `~/.config/jcode/fireworks.env`, `FIREWORKS_API_KEY`
+   - Novita AI: `~/.config/jcode/novita.env`, `NOVITA_API_KEY`
    - MiniMax: `~/.config/jcode/minimax.env`, `MINIMAX_API_KEY`
    - NVIDIA NIM: `~/.config/jcode/nvidia-nim.env`, `NVIDIA_API_KEY`
    - Alibaba Cloud Coding Plan: existing jcode config/env if present

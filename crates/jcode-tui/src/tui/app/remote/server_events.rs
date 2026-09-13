@@ -2,6 +2,7 @@ use super::*;
 use crate::tool::selfdev::ReloadContext;
 use crate::tui::TuiState;
 use crate::tui::app as app_mod;
+use crate::tui::app::remote::input_dispatch::restore_pending_startup_prompt_echo;
 use crate::tui::app::remote::swarm_plan_core::RemoteSwarmPlanSnapshot;
 use crate::tui::app::remote::swarm_status_core::swarm_status_transition_notice;
 
@@ -402,6 +403,7 @@ mod history_dedup_tests {
 
     fn message(role: &str, content: &str) -> HistoryMessage {
         HistoryMessage {
+            response_stats: None,
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,
@@ -411,6 +413,7 @@ mod history_dedup_tests {
 
     fn image(data: &str) -> RenderedImage {
         RenderedImage {
+            history_message_index: None,
             media_type: "image/png".to_string(),
             data: data.to_string(),
             label: None,
@@ -1222,8 +1225,9 @@ pub(in crate::tui::app) fn handle_server_event(
             // queue and re-adopt the running-turn state so the queue
             // dispatches once the real turn completes.
             if message == "Already processing a message"
-                && recover_undelivered_queued_continuation(app, "server busy rejection")
+                && recover_rejected_queued_continuation(app)
             {
+                remote.clear_pending();
                 app.is_processing = true;
                 app.status = ProcessingStatus::Thinking(Instant::now());
                 app.current_message_id = None;
@@ -1538,10 +1542,12 @@ pub(in crate::tui::app) fn handle_server_event(
             let history_mcp_count = mcp_servers.len();
             let history_model = provider_model.clone();
 
-            if should_defer_history_for_runtime_identity(
-                server_has_update,
-                server_version.as_deref(),
-            ) {
+            if !crate::tui::is_ssh_remote()
+                && should_defer_history_for_runtime_identity(
+                    server_has_update,
+                    server_version.as_deref(),
+                )
+            {
                 let client_detected_stale = server_release_is_older_than_client(
                     server_version.as_deref(),
                     &client_release_version(),
@@ -1613,9 +1619,19 @@ pub(in crate::tui::app) fn handle_server_event(
             crate::set_current_session(&session_id);
             app.note_client_focus(true);
             let session_changed = prev_session_id.as_deref() != Some(session_id.as_str());
+            // The initial Subscribe snapshot predates an early startup Message
+            // sent on the same ordered connection. Adopting its session id must
+            // not make that in-flight request idle or discard its retry payload.
+            // An actual session switch must still reset the old session's state.
+            let preserve_startup_send = prev_session_id.is_none()
+                && !remote.has_loaded_history()
+                && app.pending_startup_prompt_echo.is_some()
+                && app.current_message_id.is_some();
 
             if session_changed {
-                app.rate_limit_pending_message = None;
+                if !preserve_startup_send {
+                    app.rate_limit_pending_message = None;
+                }
                 app.rate_limit_reset = None;
                 app.connection_type = None;
                 app.status_detail = None;
@@ -1644,16 +1660,18 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.kv_cache.kv_cache_turn_number = None;
                 app.kv_cache.kv_cache_turn_call_index = 0;
                 app.kv_cache.kv_cache_miss_samples.clear();
-                app.processing_started = None;
-                app.clear_visible_turn_started();
+                if !preserve_startup_send {
+                    app.processing_started = None;
+                    app.clear_visible_turn_started();
+                    app.last_stream_activity = None;
+                    app.is_processing = false;
+                    app.status = ProcessingStatus::Idle;
+                }
                 app.replay_processing_started_ms = None;
                 app.replay_elapsed_override = None;
                 app.reset_streaming_tps();
-                app.last_stream_activity = None;
                 app.stream_message_ended = false;
                 app.remote_resume_activity = None;
-                app.is_processing = false;
-                app.status = ProcessingStatus::Idle;
                 app.follow_chat_bottom();
                 if prev_session_id.is_some() {
                     app.queued_messages.clear();
@@ -1698,7 +1716,9 @@ pub(in crate::tui::app) fn handle_server_event(
             if session_changed || status_detail.is_some() {
                 app.status_detail = status_detail;
             }
-            app.remote_reasoning_effort = reasoning_effort;
+            if session_changed || reasoning_effort.is_some() {
+                app.remote_reasoning_effort = reasoning_effort;
+            }
             app.remote_service_tier = service_tier;
             app.remote_compaction_mode = Some(compaction_mode);
             app.set_side_panel_snapshot(side_panel);
@@ -1720,6 +1740,10 @@ pub(in crate::tui::app) fn handle_server_event(
             if catalog_outcome.catalog_changed {
                 app.persist_remote_model_catalog_cache();
             }
+            // `/model` may have been opened while the initial session catalog
+            // was still loading. Replace that loading row as soon as history
+            // supplies the authoritative snapshot.
+            app.refresh_open_model_picker_after_catalog_update();
             app.remote_skills = skills;
             app.invalidate_command_candidates_cache();
             app.remote_sessions = all_sessions;
@@ -1766,7 +1790,10 @@ pub(in crate::tui::app) fn handle_server_event(
             app.workspace_client
                 .sync_after_history(&session_id, &app.remote_sessions);
 
-            if server_has_update == Some(true) && !app.pending_server_reload {
+            if !crate::tui::is_ssh_remote()
+                && server_has_update == Some(true)
+                && !app.pending_server_reload
+            {
                 app.pending_server_reload = true;
                 app.set_status_notice("Server update available");
             }
@@ -1826,7 +1853,11 @@ pub(in crate::tui::app) fn handle_server_event(
                 // History arrived: cancel the "stuck on loading session…"
                 // recovery watchdog so it doesn't re-request on a later tick.
                 app.clear_remote_history_wait();
-                if messages.is_empty() && !session_changed && !app.display_messages().is_empty() {
+                if !crate::tui::is_ssh_remote()
+                    && messages.is_empty()
+                    && !session_changed
+                    && !app.display_messages().is_empty()
+                {
                     crate::logging::info(
                         "Preserving locally restored display history for metadata-only History bootstrap",
                     );
@@ -1834,13 +1865,15 @@ pub(in crate::tui::app) fn handle_server_event(
                     let fingerprint = history_payload_fingerprint(&messages);
                     let last_applied =
                         last_applied_history_fingerprint(&app.remote_client_instance_id);
-                    if should_skip_identical_history_payload(
-                        session_changed,
-                        app.display_messages().is_empty(),
-                        last_applied.as_ref(),
-                        &session_id,
-                        fingerprint,
-                    ) {
+                    if !crate::tui::is_ssh_remote()
+                        && should_skip_identical_history_payload(
+                            session_changed,
+                            app.display_messages().is_empty(),
+                            last_applied.as_ref(),
+                            &session_id,
+                            fingerprint,
+                        )
+                    {
                         // Watchdog re-requests and reconnect re-bootstraps can
                         // redeliver a byte-identical full payload seconds apart.
                         // Rebuilding the transcript would stack multi-megabyte
@@ -1896,7 +1929,9 @@ pub(in crate::tui::app) fn handle_server_event(
                             // chunks. The server rejects rewinds while a turn
                             // is processing, so streaming state present at this
                             // point is stale by construction.
-                            if app.pending_remote_rewind_notice.is_some() {
+                            if app.pending_remote_rewind_notice.is_some()
+                                || crate::tui::is_ssh_remote()
+                            {
                                 app.stream_buffer.clear();
                                 app.clear_streaming_render_state();
                                 app.streaming_tool_calls.clear();
@@ -1929,6 +1964,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     app.pending_images.clear();
                     app.set_status_notice("Reload complete - prompt preserved");
                 }
+                restore_pending_startup_prompt_echo(app);
                 app.note_runtime_memory_event_force("history_loaded", "remote_history_applied");
                 crate::process_memory::release_retained_heap("client_history_loaded");
                 if let Some(notice) = app.pending_remote_rewind_notice.take() {
@@ -2262,6 +2298,16 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::ModelUsageUpdated { route } => {
+            for cached in &mut app.remote_model_options {
+                if cached.model == route.model && cached.provider == route.provider
+                    && cached.api_method == route.api_method {
+                    cached.usage = route.usage.clone();
+                }
+            }
+            app.invalidate_model_picker_cache();
+            true
+        }
         ServerEvent::AvailableModelsUpdated {
             provider_name,
             provider_model,
@@ -2438,14 +2484,31 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             app.mark_soft_interrupt_injected(&content);
             let role = display_role.unwrap_or_else(|| "user".to_string());
-            app.push_display_message(DisplayMessage {
-                role,
-                content: content.clone(),
-                tool_calls: vec![],
-                duration_secs: None,
-                title: None,
-                tool_data: None,
-            });
+            if role == "background_task" {
+                if let Some(completed) =
+                    crate::message::parse_background_task_notification_markdown(&content)
+                {
+                    let status = if completed.status.contains("completed") {
+                        crate::tui::BackgroundTaskRowStatus::Completed
+                    } else {
+                        crate::tui::BackgroundTaskRowStatus::Failed
+                    };
+                    let label = crate::message::background_task_display_label(
+                        &completed.tool_name,
+                        completed.display_name.as_deref(),
+                    );
+                    app.finish_background_task(completed.task_id, label, status);
+                }
+            } else {
+                app.push_display_message(DisplayMessage {
+                    role,
+                    content: content.clone(),
+                    tool_calls: vec![],
+                    duration_secs: None,
+                    title: None,
+                    tool_data: None,
+                });
+            }
             if let Some(n) = tools_skipped {
                 app.set_status_notice(format!("⚡ {} tool(s) skipped", n));
             }
@@ -2526,11 +2589,23 @@ pub(in crate::tui::app) fn handle_server_event(
                 if crate::message::parse_background_task_progress_notification_markdown(&message)
                     .is_some()
                 {
-                    app.upsert_background_task_progress_message(message.clone());
+                    app.upsert_running_background_task_progress(&message);
                 } else {
-                    app.push_display_message(DisplayMessage::background_task(message.clone()));
+                    if let Some(completed) =
+                        crate::message::parse_background_task_notification_markdown(&message)
+                    {
+                        let status = if completed.status.contains("completed") {
+                            crate::tui::BackgroundTaskRowStatus::Completed
+                        } else {
+                            crate::tui::BackgroundTaskRowStatus::Failed
+                        };
+                        let label = crate::message::background_task_display_label(
+                            &completed.tool_name,
+                            completed.display_name.as_deref(),
+                        );
+                        app.finish_background_task(completed.task_id, label, status);
+                    }
                 }
-                persist_replay_display_message(app, "background_task", None, &message);
                 app.set_status_notice(presentation.status_notice);
                 return false;
             }
@@ -2559,13 +2634,14 @@ pub(in crate::tui::app) fn handle_server_event(
                         )
                 {
                     let status_notice = progress.summary.clone();
-                    app.upsert_background_task_progress_message(message.clone());
-                    persist_replay_display_message(app, "background_task", None, &message);
+                    app.upsert_running_background_task_progress(&message);
                     app.set_status_notice(status_notice);
                     return false;
                 } else if scope == "background_activity" {
-                    app.push_display_message(DisplayMessage::background_task(message.clone()));
-                    persist_replay_display_message(app, "background_task", None, &message);
+                    if !app.upsert_running_background_task_started(&message) {
+                        app.push_display_message(DisplayMessage::background_task(message.clone()));
+                        persist_replay_display_message(app, "background_task", None, &message);
+                    }
                 } else {
                     app.push_display_message(DisplayMessage::system(message.clone()));
                     persist_replay_display_message(app, "system", None, &message);
@@ -2702,6 +2778,13 @@ pub(in crate::tui::app) fn handle_server_event(
                     new_session_name,
                 )));
                 app.set_status_notice(format!("Workspace + {}", new_session_name));
+                return false;
+            }
+            if crate::tui::is_ssh_remote() {
+                app.pending_split_request = false;
+                app.set_status_notice(format!(
+                    "Remote session created: {new_session_id}. Resume using --ssh and --resume."
+                ));
                 return false;
             }
             finish_remote_split_launch(app);

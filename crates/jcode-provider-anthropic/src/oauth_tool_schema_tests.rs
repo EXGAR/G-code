@@ -12,6 +12,7 @@ use serde_json::json;
 
 fn tool_def(name: &str) -> ToolDefinition {
     ToolDefinition {
+        execution_mode: None,
         name: name.to_string(),
         description: format!("{name} description"),
         input_schema: json!({"type":"object","properties":{}}),
@@ -33,6 +34,7 @@ fn oauth_schedule_wakeup_forwards_the_real_schedule_schema() {
         "required": ["intent"]
     });
     let registry = vec![ToolDefinition {
+        execution_mode: None,
         name: "schedule".to_string(),
         description: "Schedule, list, or cancel future tasks.".to_string(),
         input_schema: real_schema.clone(),

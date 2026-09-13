@@ -326,6 +326,44 @@ fn render_and_snap(
 }
 
 #[test]
+fn test_blockquote_paragraph_border_is_continuous_in_terminal_cells() {
+    let _lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = create_blockquote_copy_test_app();
+    app.diagram_mode = crate::config::DiagramDisplayMode::None;
+    app.diagram_pane_enabled = false;
+    app.display_messages[1].content =
+        "Draft only:\n\n> Hello,\n>\n> A quoted paragraph.\n>\n> Thanks,\n> Someone\n\nOutside the quote."
+            .to_string();
+    app.bump_display_messages_version();
+    let screen = render_and_snap(&app, &mut terminal);
+    let rows: Vec<_> = screen.lines().collect();
+    let start = rows
+        .iter()
+        .position(|line| line.contains("│ Hello,"))
+        .unwrap();
+    let end = rows
+        .iter()
+        .position(|line| line.contains("│ Someone"))
+        .unwrap();
+    let gutter_x = rows[start].chars().position(|ch| ch == '│').unwrap();
+    assert_eq!(end - start, 5, "paragraph spacing changed:\n{screen}");
+    let buffer = terminal.backend().buffer();
+    for y in start..=end {
+        assert_eq!(
+            buffer[(gutter_x as u16, y as u16)].symbol(),
+            "│",
+            "gap on row {y}:\n{screen}"
+        );
+    }
+    assert_eq!(buffer[(gutter_x as u16, (start - 1) as u16)].symbol(), " ");
+    assert_eq!(buffer[(gutter_x as u16, (end + 1) as u16)].symbol(), " ");
+    eprintln!(
+        "Verified six continuous quote-border cells, including two paragraph separators:\n{}",
+        rows[start..=end].join("\n")
+    );
+}
+
+#[test]
 fn test_armed_new_session_mode_shows_input_hint_and_indicator() {
     let _lock = scroll_render_test_lock();
 
@@ -894,6 +932,7 @@ fn test_images_do_not_drive_side_panel_visibility() {
     app.is_remote = true;
     app.side_panel = crate::side_panel::SidePanelSnapshot::default();
     app.remote_side_pane_images.push(crate::session::RenderedImage {
+        history_message_index: None,
         media_type: "image/png".to_string(),
         data: "image-data".to_string(),
         label: Some("preview.png".to_string()),
@@ -925,6 +964,36 @@ fn test_remote_alt_m_toggles_side_panel_visibility() {
         .unwrap();
     assert_eq!(app.side_panel.focused_page_id.as_deref(), Some("plan"));
     assert_eq!(app.status_notice(), Some("Side panel: Plan".to_string()));
+}
+
+#[test]
+fn test_remote_alt_y_toggles_copy_selection_instead_of_typing() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    rt.block_on(app.handle_remote_key(KeyCode::Char('y'), KeyModifiers::ALT, &mut remote))
+        .unwrap();
+
+    assert!(app.copy_selection_mode);
+    assert!(app.input.is_empty(), "Alt+Y must not insert text");
+}
+
+#[test]
+fn test_remote_alt_i_toggles_info_widget_instead_of_typing() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let initially_enabled = crate::tui::info_widget::is_enabled();
+
+    rt.block_on(app.handle_remote_key(KeyCode::Char('i'), KeyModifiers::ALT, &mut remote))
+        .unwrap();
+
+    assert_ne!(crate::tui::info_widget::is_enabled(), initially_enabled);
+    assert!(app.input.is_empty(), "Alt+I must not insert text");
+    crate::tui::info_widget::toggle_enabled();
 }
 
 #[test]

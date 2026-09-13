@@ -68,7 +68,9 @@ async fn available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> ModelCatalogSna
 }
 
 fn available_models_snapshot_from_provider(provider: &Arc<dyn Provider>) -> ModelCatalogSnapshot {
-    ModelCatalogSnapshot::from_provider(provider.as_ref())
+    let mut snapshot = ModelCatalogSnapshot::from_provider(provider.as_ref());
+    crate::model_usage::enrich_routes(&mut snapshot.model_routes);
+    snapshot
 }
 
 pub(super) async fn available_models_updated_event(agent: &Arc<Mutex<Agent>>) -> ServerEvent {
@@ -1175,8 +1177,9 @@ pub(super) async fn handle_notify_auth_changed(
                     .await;
                 }
             } else if let Some(model_to_select) =
-                crate::auth::lifecycle::provider_model_to_select_after_auth(
+                crate::auth::lifecycle::provider_model_to_select_after_auth_with_configured_default(
                     &activation,
+                    crate::config::config().provider.default_model.as_deref(),
                     latest_snapshot.provider_model.as_deref(),
                     &latest_snapshot.model_routes,
                 )
@@ -1434,6 +1437,14 @@ mod tests {
             vec!["test-model-a".to_string(), "test-model-b".to_string()]
         }
 
+        fn context_window(&self) -> usize {
+            if self.model() == "test-model-b" {
+                32_000
+            } else {
+                16_000
+            }
+        }
+
         fn reasoning_effort(&self) -> Option<String> {
             self.effort.lock().expect("effort lock").clone()
         }
@@ -1553,6 +1564,7 @@ mod tests {
             .await
             .expect("deferred model change should finish after agent is idle");
         assert_eq!(provider.model(), "test-model-b");
+        assert_eq!(agent.lock().await.compaction_token_budget().await, 32_000);
         assert!(matches!(
             event,
             Some(ServerEvent::ModelChanged {

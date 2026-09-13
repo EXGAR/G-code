@@ -5,6 +5,7 @@ fn test_request_roundtrip() -> Result<()> {
         content: "hello".to_string(),
         images: vec![],
         system_reminder: None,
+        active_skill: Some("verification".to_string()),
         no_reply: false,
     };
     let json = serde_json::to_string(&req)?;
@@ -33,7 +34,10 @@ fn test_soft_interrupt_images_roundtrip_and_legacy_default() -> Result<()> {
         return Err(anyhow!("wrong request type"));
     };
     assert_eq!(content, "look at this");
-    assert_eq!(images, vec![("image/png".to_string(), "ZmFrZQ==".to_string())]);
+    assert_eq!(
+        images,
+        vec![("image/png".to_string(), "ZmFrZQ==".to_string())]
+    );
     assert!(urgent);
 
     let legacy = r#"{"type":"soft_interrupt","id":3,"content":"legacy","urgent":false}"#;
@@ -144,10 +148,15 @@ fn test_notify_auth_changed_typed_auth_payload_roundtrip() -> Result<()> {
     assert!(!prefer_strongest);
     let auth = auth.expect("typed auth payload should roundtrip");
     assert_eq!(auth.provider.as_str(), "cerebras");
-    assert_eq!(auth.credential_source, Some(AuthCredentialSource::ApiKeyFile));
+    assert_eq!(
+        auth.credential_source,
+        Some(AuthCredentialSource::ApiKeyFile)
+    );
     assert_eq!(auth.auth_method, Some(AuthMethod::RemoteTuiPasteApiKey));
     assert_eq!(
-        auth.expected_runtime.as_ref().map(RuntimeProviderKey::as_str),
+        auth.expected_runtime
+            .as_ref()
+            .map(RuntimeProviderKey::as_str),
         Some("openai-compatible")
     );
     assert_eq!(
@@ -349,6 +358,7 @@ fn test_side_pane_images_event_roundtrip() -> Result<()> {
     let event = ServerEvent::SidePaneImages {
         session_id: "session_active".to_string(),
         images: vec![jcode_session_types::RenderedImage {
+            history_message_index: None,
             media_type: "image/png".to_string(),
             data: "base64-data".to_string(),
             label: Some("openclaw.png".to_string()),
@@ -432,6 +442,7 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         id: 101,
         session_id: "ses_test_456".to_string(),
         messages: vec![HistoryMessage {
+            response_stats: None,
             role: "assistant".to_string(),
             content: "hello".to_string(),
             tool_calls: None,
@@ -523,6 +534,7 @@ fn test_compacted_history_event_roundtrip() -> Result<()> {
         id: 77,
         session_id: "ses_compact_123".to_string(),
         messages: vec![HistoryMessage {
+            response_stats: None,
             role: "assistant".to_string(),
             content: "older response".to_string(),
             tool_calls: None,

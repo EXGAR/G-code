@@ -184,6 +184,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/rebuild", "Background rebuild and auto reload"),
     RegisteredCommand::public("/selfdev", "Open a new self-dev jcode session"),
     RegisteredCommand::public("/update", "Background update and auto reload"),
+    RegisteredCommand::public("/update-sim", "Preview update UI safely (Alt+_)"),
     RegisteredCommand::public("/resume", "Open session picker"),
     RegisteredCommand::public("/sessions", "Alias for /resume"),
     RegisteredCommand::public("/session", "Alias for /resume"),
@@ -483,6 +484,19 @@ impl App {
     pub(super) fn get_suggestions_for(&self, input: &str) -> Vec<(String, &'static str)> {
         let input = input.trim_start();
 
+        if crate::tui::is_ssh_remote() {
+            // Do not enumerate local account labels, projects, or goals while
+            // completing a command intended for a different host.
+            if input.starts_with("/model ") || input.starts_with("/models ") {
+                return self.rank_suggestions(input, self.model_suggestion_candidates());
+            }
+            return if input.starts_with('/') {
+                self.rank_suggestions(input, self.command_candidates())
+            } else {
+                Vec::new()
+            };
+        }
+
         // Only show suggestions when input starts with /
         if !input.starts_with('/') {
             return vec![];
@@ -524,27 +538,19 @@ impl App {
         }
 
         if prefix.starts_with("/subagent-model ") {
-            let mut suggestions = vec![
-                (
-                    "/subagent-model inherit".into(),
-                    "Use the current active model",
-                ),
-                (
-                    "/subagent-model show".into(),
-                    "Show the current subagent model policy",
-                ),
-            ];
-            suggestions.extend(
-                self.model_suggestion_candidates()
-                    .into_iter()
-                    .map(|(cmd, _)| {
-                        (
-                            cmd.replacen("/model ", "/subagent-model ", 1),
-                            "Pin this subagent model",
-                        )
-                    }),
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/subagent-model inherit".into(),
+                        "Use the current active model",
+                    ),
+                    (
+                        "/subagent-model show".into(),
+                        "Show the current subagent model policy",
+                    ),
+                ],
             );
-            return self.rank_suggestions(input, suggestions);
         }
 
         if prefix.starts_with("/autoreview ") {
@@ -1320,6 +1326,9 @@ impl App {
     /// suggestion prompts (brand-new install / unauthenticated / new user) so
     /// the welcome layout and the suggestions stay in sync.
     pub fn onboarding_welcome_active(&self) -> bool {
+        if crate::tui::is_ssh_remote() {
+            return false;
+        }
         if self.onboarding_preview_mode {
             return true;
         }
@@ -1429,6 +1438,9 @@ impl App {
     /// Get suggestion prompts for new users on the initial empty screen.
     /// Returns (label, prompt_text) pairs. Empty once user is experienced or not authenticated.
     pub fn suggestion_prompts(&self) -> Vec<(String, String)> {
+        if crate::tui::is_ssh_remote() {
+            return Vec::new();
+        }
         let preview_mode = self.onboarding_preview_mode;
         let is_canary = if self.is_remote {
             self.remote_is_canary.unwrap_or(self.session.is_canary)

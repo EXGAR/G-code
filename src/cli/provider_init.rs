@@ -61,6 +61,8 @@ pub enum ProviderChoice {
     #[value(alias = "302.ai")]
     Ai302,
     Baseten,
+    #[value(alias = "conifer-api")]
+    Conifer,
     Cortecs,
     #[value(alias = "cgc", alias = "comtegra-gpu-cloud")]
     Comtegra,
@@ -86,10 +88,15 @@ pub enum ProviderChoice {
     Deepinfra,
     #[value(alias = "fireworks-ai", alias = "fireworks.ai")]
     Fireworks,
+    #[value(alias = "novita-ai", alias = "novita.ai")]
+    Novita,
     #[value(alias = "minimax-ai", alias = "minimaxi")]
     Minimax,
     #[value(alias = "x.ai", alias = "x-ai", alias = "grok")]
     Xai,
+    /// Grok Build subscription via the authenticated Grok CLI ACP transport.
+    #[value(name = "grok-build")]
+    GrokBuild,
     #[value(alias = "nvidia", alias = "nim")]
     NvidiaNim,
     #[value(alias = "xiaomi", alias = "mimo", alias = "xiaomi-mimo-api")]
@@ -110,6 +117,8 @@ pub enum ProviderChoice {
     Chutes,
     #[value(alias = "cerebrascode", alias = "cerberascode")]
     Cerebras,
+    #[value(alias = "belvedir.ai", alias = "belvedir-ai")]
+    Belvedir,
     #[value(
         alias = "bailian",
         alias = "aliyun-bailian",
@@ -153,6 +162,7 @@ impl ProviderChoice {
             Self::Kimi => "kimi",
             Self::Ai302 => "302ai",
             Self::Baseten => "baseten",
+            Self::Conifer => "conifer",
             Self::Cortecs => "cortecs",
             Self::Comtegra => "comtegra",
             Self::Deepseek => "deepseek",
@@ -169,8 +179,10 @@ impl ProviderChoice {
             Self::TogetherAi => "togetherai",
             Self::Deepinfra => "deepinfra",
             Self::Fireworks => "fireworks",
+            Self::Novita => "novita",
             Self::Minimax => "minimax",
             Self::Xai => "xai",
+            Self::GrokBuild => "grok-build",
             Self::NvidiaNim => "nvidia-nim",
             Self::XiaomiMimo => "xiaomi-mimo",
             Self::MetaMuse => "meta-muse",
@@ -179,6 +191,7 @@ impl ProviderChoice {
             Self::Ollama => "ollama",
             Self::Chutes => "chutes",
             Self::Cerebras => "cerebras",
+            Self::Belvedir => "belvedir",
             Self::AlibabaCodingPlan => "alibaba-coding-plan",
             Self::OpenaiCompatible => "openai-compatible",
             Self::Cursor => "cursor",
@@ -255,6 +268,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
         crate::provider_catalog::BASETEN_LOGIN_PROVIDER,
     ),
     (
+        ProviderChoice::Conifer,
+        crate::provider_catalog::CONIFER_LOGIN_PROVIDER,
+    ),
+    (
         ProviderChoice::Cortecs,
         crate::provider_catalog::CORTECS_LOGIN_PROVIDER,
     ),
@@ -319,12 +336,20 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
         crate::provider_catalog::FIREWORKS_LOGIN_PROVIDER,
     ),
     (
+        ProviderChoice::Novita,
+        crate::provider_catalog::NOVITA_LOGIN_PROVIDER,
+    ),
+    (
         ProviderChoice::Minimax,
         crate::provider_catalog::MINIMAX_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Xai,
         crate::provider_catalog::XAI_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::GrokBuild,
+        crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::NvidiaNim,
@@ -357,6 +382,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
     (
         ProviderChoice::Cerebras,
         crate::provider_catalog::CEREBRAS_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::Belvedir,
+        crate::provider_catalog::BELVEDIR_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::AlibabaCodingPlan,
@@ -1285,6 +1314,13 @@ pub async fn login_and_bootstrap_provider(
             disable_subscription_runtime_mode();
             Arc::new(provider::MultiProvider::with_preference(true))
         }
+        LoginProviderTarget::GrokBuild => {
+            disable_subscription_runtime_mode();
+            crate::provider::external::instantiate_external_provider(
+                crate::provider::external::GROK_BUILD_RUNTIME,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Grok Build runtime is not registered"))?
+        }
         LoginProviderTarget::OpenAiApiKey => {
             disable_subscription_runtime_mode();
             select_initial_model_provider("openai");
@@ -1502,6 +1538,16 @@ async fn init_provider_with_options(
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "gemini");
             Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new())
         }
+        ProviderChoice::GrokBuild => {
+            disable_subscription_runtime_mode();
+            init_notice("Using Grok Build subscription via the authenticated Grok CLI");
+            clear_initial_model_provider();
+            crate::env::set_var("JCODE_ACTIVE_PROVIDER", "grok-build");
+            crate::provider::external::instantiate_external_provider(
+                crate::provider::external::GROK_BUILD_RUNTIME,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Grok Build runtime is not registered"))?
+        }
         ProviderChoice::Openrouter => {
             disable_subscription_runtime_mode();
             ensure_external_api_key_auth_allowed_for_explicit_choice("OPENROUTER_API_KEY")?;
@@ -1530,6 +1576,7 @@ async fn init_provider_with_options(
         | ProviderChoice::Zai
         | ProviderChoice::Ai302
         | ProviderChoice::Baseten
+        | ProviderChoice::Conifer
         | ProviderChoice::Cortecs
         | ProviderChoice::Comtegra
         | ProviderChoice::Deepseek
@@ -1547,6 +1594,7 @@ async fn init_provider_with_options(
         | ProviderChoice::TogetherAi
         | ProviderChoice::Deepinfra
         | ProviderChoice::Fireworks
+        | ProviderChoice::Novita
         | ProviderChoice::Minimax
         | ProviderChoice::Xai
         | ProviderChoice::NvidiaNim
@@ -1557,6 +1605,7 @@ async fn init_provider_with_options(
         | ProviderChoice::Ollama
         | ProviderChoice::Chutes
         | ProviderChoice::Cerebras
+        | ProviderChoice::Belvedir
         | ProviderChoice::AlibabaCodingPlan
         | ProviderChoice::GeminiApi
         | ProviderChoice::OpenaiCompatible => {

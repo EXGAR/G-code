@@ -14,6 +14,7 @@ mod debug_socket;
 mod discover;
 mod discover_secrets;
 mod edit;
+mod feedback;
 mod gmail;
 mod goal;
 pub mod inflight;
@@ -45,13 +46,24 @@ use jcode_message_types::ToolDefinition;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
-    allowed.contains(name) || (allowed.contains("mcp") && name.starts_with("mcp__"))
+    allowed.contains(name)
+        || (allowed.contains("mcp") && is_mcp_tool_name(name))
+        || (is_fixed_mcp_tool(name) && allowed.iter().any(|tool| tool.starts_with("mcp__")))
 }
 
 pub(crate) fn tool_name_is_disabled(disabled: &HashSet<String>, name: &str) -> bool {
-    disabled.contains(name) || (disabled.contains("mcp") && name.starts_with("mcp__"))
+    disabled.contains(name) || (disabled.contains("mcp") && is_mcp_tool_name(name))
+}
+
+fn is_fixed_mcp_tool(name: &str) -> bool {
+    matches!(name, "mcp_search" | "mcp_call")
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name == "mcp" || name.starts_with("mcp__") || is_fixed_mcp_tool(name)
 }
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
@@ -65,11 +77,60 @@ pub(crate) use session_search::spawn_recent_index_warmup;
 struct SessionToolPolicy {
     allowed_tools: Option<HashSet<String>>,
     disabled_tools: HashSet<String>,
+    owner: Option<u64>,
 }
 
 static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
     LazyLock::new(|| StdRwLock::new(HashMap::new()));
+static NEXT_SESSION_TOOL_POLICY_OWNER: AtomicU64 = AtomicU64::new(1);
 
+/// Removes an Agent-owned policy when that Agent actually leaves memory.
+///
+/// The owner token prevents a stale Agent from removing the policy installed by
+/// a successor connection for the same persisted session ID.
+pub(crate) struct SessionToolPolicyRegistration {
+    session_id: String,
+    owner: u64,
+}
+
+impl Drop for SessionToolPolicyRegistration {
+    fn drop(&mut self) {
+        let mut policies = SESSION_TOOL_POLICIES
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if policies
+            .get(&self.session_id)
+            .is_some_and(|policy| policy.owner == Some(self.owner))
+        {
+            policies.remove(&self.session_id);
+        }
+    }
+}
+
+pub(crate) fn register_session_tool_policy(
+    session_id: &str,
+    allowed_tools: Option<HashSet<String>>,
+    disabled_tools: HashSet<String>,
+) -> SessionToolPolicyRegistration {
+    let owner = NEXT_SESSION_TOOL_POLICY_OWNER.fetch_add(1, Ordering::Relaxed);
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    policies.insert(
+        session_id.to_string(),
+        SessionToolPolicy {
+            allowed_tools,
+            disabled_tools,
+            owner: Some(owner),
+        },
+    );
+    SessionToolPolicyRegistration {
+        session_id: session_id.to_string(),
+        owner,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn set_session_tool_policy(
     session_id: &str,
     allowed_tools: Option<HashSet<String>>,
@@ -83,10 +144,12 @@ pub(crate) fn set_session_tool_policy(
         SessionToolPolicy {
             allowed_tools,
             disabled_tools,
+            owner: None,
         },
     );
 }
 
+#[cfg(test)]
 pub(crate) fn clear_session_tool_policy(session_id: &str) {
     let mut policies = SESSION_TOOL_POLICIES
         .write()
@@ -100,6 +163,37 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(session_id)
         .cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn session_tool_policy_allows_tool_for_test(
+    session_id: &str,
+    tool_name: &str,
+) -> Option<bool> {
+    session_tool_policy(session_id).map(|policy| {
+        policy
+            .allowed_tools
+            .as_ref()
+            .is_none_or(|allowed| tool_name_is_allowed(allowed, tool_name))
+            && !tool_name_is_disabled(&policy.disabled_tools, tool_name)
+    })
+}
+
+/// Apply the current session policy to an MCP server tool invoked through a
+/// fixed deferred surface. Explicitly enabling the fixed surface authorizes its
+/// underlying MCP calls, while per-tool allow/deny entries remain effective.
+pub(crate) fn session_mcp_dispatch_is_allowed(
+    session_id: &str,
+    dispatched_name: &str,
+    fixed_surface: &str,
+) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return true;
+    };
+    let allowed = policy.allowed_tools.as_ref().is_none_or(|allowed| {
+        tool_name_is_allowed(allowed, dispatched_name) || allowed.contains(fixed_surface)
+    });
+    allowed && !tool_name_is_disabled(&policy.disabled_tools, dispatched_name)
 }
 
 /// Whether a tool call opted in to receiving an oversized (truncated) result.
@@ -138,6 +232,26 @@ pub struct Registry {
     compaction: Arc<RwLock<CompactionManager>>,
 }
 
+/// Non-owning handle used by tools stored inside a registry.
+///
+/// A tool cannot strongly own the registry containing it without creating an
+/// Arc cycle. Upgrade this handle only for the duration of a tool call.
+pub(super) struct WeakRegistry {
+    tools: std::sync::Weak<RwLock<HashMap<String, Arc<dyn Tool>>>>,
+    skills: Arc<RwLock<SkillRegistry>>,
+    compaction: Arc<RwLock<CompactionManager>>,
+}
+
+impl WeakRegistry {
+    pub(super) fn upgrade(&self) -> Option<Registry> {
+        Some(Registry {
+            tools: self.tools.upgrade()?,
+            skills: Arc::clone(&self.skills),
+            compaction: Arc::clone(&self.compaction),
+        })
+    }
+}
+
 impl Clone for Registry {
     fn clone(&self) -> Self {
         Self {
@@ -151,6 +265,14 @@ impl Clone for Registry {
 }
 
 impl Registry {
+    fn downgrade(&self) -> WeakRegistry {
+        WeakRegistry {
+            tools: Arc::downgrade(&self.tools),
+            skills: Arc::clone(&self.skills),
+            compaction: Arc::clone(&self.compaction),
+        }
+    }
+
     fn shared_skills_registry() -> Arc<RwLock<SkillRegistry>> {
         SkillRegistry::shared_registry()
     }
@@ -249,17 +371,17 @@ impl Registry {
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
+                "maintainer_feedback",
+                feedback::MaintainerFeedbackTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
                 "jcode_docs",
                 jcode_docs::JcodeDocsTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "swarm",
-                communicate::CommunicateTool::new,
-            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -296,6 +418,12 @@ impl Registry {
             "skill_manage",
             skill::SkillTool::new(skills.clone()),
         );
+        // The swarm tool captures the user-editable swarm prompt in its
+        // description. Construct it once per session rather than sharing the
+        // process-wide instance. Existing sessions keep their stable tool
+        // definition (and provider KV cache), while newly created agents see
+        // prompt edits immediately.
+        Self::insert_tool(&mut tools, "swarm", communicate::CommunicateTool::new());
         tools
     }
 
@@ -324,7 +452,7 @@ impl Registry {
         Self::insert_tool(
             &mut tools_map,
             "batch",
-            batch::BatchTool::new(registry.clone()),
+            batch::BatchTool::new(registry.downgrade()),
         );
         Self::insert_tool(
             &mut tools_map,
@@ -958,6 +1086,16 @@ impl Registry {
             mcp::McpManagementTool::new(Arc::clone(&mcp_manager)).with_registry(self.clone());
         self.register("mcp".to_string(), Arc::new(mcp_tool) as Arc<dyn Tool>)
             .await;
+        self.register(
+            "mcp_search".to_string(),
+            Arc::new(mcp::McpSearchTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
+        self.register(
+            "mcp_call".to_string(),
+            Arc::new(mcp::McpCallTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
 
         // Check if we have enabled servers to connect to. Disabled servers stay
         // configured (visible to the mcp management tool, connectable by name)

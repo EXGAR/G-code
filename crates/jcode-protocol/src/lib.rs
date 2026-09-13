@@ -50,6 +50,8 @@ pub enum CommDeliveryMode {
 /// A message in conversation history (for sync)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_stats: Option<jcode_session_types::ResponseStats>,
     pub role: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +251,9 @@ pub struct AgentInfo {
     /// Provider model id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_model: Option<String>,
+    /// Reasoning effort the agent's provider is running with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_effort: Option<String>,
     /// Number of turns the agent has run this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_count: Option<u64>,
@@ -574,9 +579,9 @@ impl Request {
             Request::DebugCommand { id, .. } => *id,
             Request::ClientDebugCommand { id, .. } => *id,
             Request::ClientDebugResponse { id, .. } => *id,
-            Request::Subscribe { id, .. } => *id,
+            Request::Subscribe { id, .. } | Request::PrepareDisconnect { id } => *id,
             Request::GetHistory { id } => *id,
-            Request::GetModelCatalog { id } => *id,
+            Request::GetModelCatalog { id, .. } => *id,
             Request::GetCompactedHistory { id, .. } => *id,
             Request::Reload { id, .. } => *id,
             Request::ResumeSession { id, .. } => *id,

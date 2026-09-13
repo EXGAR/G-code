@@ -188,8 +188,6 @@ const LAUNCH_HOTKEY_TRACKING_VERSION: u32 = 1;
 /// asking, even if the user never explicitly picked "Don't ask again".
 pub const MAX_TERMINAL_NUDGES: u64 = 5;
 const LAUNCH_HOTKEY_LEARNED_USES: u64 = 3;
-#[cfg(any(test, target_os = "macos", target_os = "linux", windows))]
-const LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct StartupHints {
@@ -673,6 +671,9 @@ pub fn run_setup_hotkey(
         if _listen_macos_hotkey {
             return run_macos_hotkey_listener();
         }
+        if _uninstall {
+            return uninstall_macos_hotkey_listener();
+        }
 
         let mut state = SetupHintsState::load();
         let terminal = effective_macos_terminal();
@@ -712,6 +713,10 @@ pub fn run_setup_hotkey(
 
     #[cfg(target_os = "linux")]
     {
+        if _uninstall {
+            return uninstall_linux_launch_hotkeys();
+        }
+
         let mut state = SetupHintsState::load();
         eprintln!("\x1b[1mjcode setup-hotkey\x1b[0m");
         eprintln!();
@@ -1676,6 +1681,16 @@ fn install_linux_launch_hotkeys(comp: linux_env::LinuxCompositor) -> Result<bool
     }
 }
 
+/// Refuse to run the installer for an uninstall request. Linux hotkeys are
+/// written through several compositor-specific stores, and no safe common
+/// removal operation exists yet.
+#[cfg(target_os = "linux")]
+fn uninstall_linux_launch_hotkeys() -> Result<()> {
+    anyhow::bail!(
+        "automatic launch-hotkey removal is not supported for this Linux desktop; no changes were made"
+    )
+}
+
 /// Install (or refresh) the niri launch-hotkey binds into the user's
 /// `config.kdl`. Writes a timestamped backup before modifying, and is a no-op
 /// when the managed block already matches. Returns `Ok(true)` if the config was
@@ -2237,16 +2252,14 @@ pub(crate) struct LaunchHotkeyRow {
     pub self_dev: bool,
 }
 
-/// Decide which launch-hotkey lines to surface, given how often each chord has
-/// been used. Pure so the adaptive "stop nagging once learned" policy is
-/// unit-tested without touching config or the filesystem.
+/// Decide which launch-hotkey lines to surface on the first launch. Pure so
+/// the one-time onboarding policy is tested without config or filesystem I/O.
 ///
 /// Policy:
 /// - Hide a per-repo binding once it has been used `LAUNCH_HOTKEY_LEARNED_USES`
 ///   times (the user has clearly internalized it).
-/// - Once the user has learned at least one binding and has launched jcode at
-///   least `LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP` times, drop the whole
-///   notice so it never lingers for an experienced user.
+/// - Never repeat the notice after the first launch, even if no binding has
+///   been used. Choosing not to use global hotkeys should not cause nagging.
 /// - Returns `None` when nothing should be shown.
 #[cfg(any(test, target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn launch_hotkey_notice_lines(
@@ -2254,17 +2267,11 @@ pub(crate) fn launch_hotkey_notice_lines(
     usage: &HashMap<String, u64>,
     launch_count: u64,
 ) -> Option<Vec<String>> {
-    if rows.is_empty() {
+    if rows.is_empty() || launch_count != 1 {
         return None;
     }
 
     let uses_for = |chord: &str| usage.get(chord).copied().unwrap_or(0);
-    let learned_any = rows
-        .iter()
-        .any(|row| uses_for(&row.chord) >= LAUNCH_HOTKEY_LEARNED_USES);
-    if learned_any && launch_count >= LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP {
-        return None;
-    }
 
     let lines: Vec<String> = rows
         .iter()

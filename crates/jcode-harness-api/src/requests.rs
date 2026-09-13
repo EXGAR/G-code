@@ -10,7 +10,7 @@ pub enum ApiRequest {
     Hello {
         min_version: u32,
         max_version: u32,
-        /// Client name and version, e.g. "jcode-desktop2/0.1.0".
+        /// Client name and version, e.g. "external-client/0.1.0".
         client: String,
     },
 
@@ -19,6 +19,9 @@ pub enum ApiRequest {
         /// Include sessions the user archived through this API.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_archived: bool,
+        /// Return at most this many most-recently modified persisted sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
 
     /// Reversibly hide a session from the default list. Its transcript remains
@@ -43,6 +46,9 @@ pub enum ApiRequest {
     /// Attach to an existing session and subscribe to its event stream.
     AttachSession { session_id: String },
 
+    /// Clone an attached session's transcript into a new, idle session.
+    ForkSession { session_id: String },
+
     /// Detach from the currently attached session.
     DetachSession { session_id: String },
 
@@ -50,6 +56,9 @@ pub enum ApiRequest {
     SendMessage {
         session_id: String,
         content: String,
+        /// Hidden recovery/context instruction, not a user transcript message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_reminder: Option<String>,
         /// (media_type, base64_data) pairs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<(String, String)>,
@@ -65,6 +74,9 @@ pub enum ApiRequest {
     SoftInterrupt {
         session_id: String,
         content: String,
+        /// (media_type, base64_data) pairs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<(String, String)>,
         #[serde(default)]
         urgent: bool,
     },
@@ -119,6 +131,10 @@ pub enum ApiRequest {
 
     /// Remove a previously persisted API-key credential.
     ClearApiKey { provider: String },
+
+    /// Reload provider credentials already saved outside the harness (e.g. OAuth).
+    /// No tokens or callback input travel in this request.
+    NotifyAuthChanged { provider: String },
 
     /// Read one UTF-8 file under the session working directory.
     ReadFile {

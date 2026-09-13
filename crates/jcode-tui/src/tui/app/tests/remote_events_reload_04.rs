@@ -1,4 +1,56 @@
 #[test]
+fn test_remote_fast_status_tracks_history_tier_including_explicit_off() {
+    with_temp_jcode_home(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = create_test_app();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.is_remote = true;
+        app.remote_session_id = Some("session_fast_status".to_string());
+        remote.mark_history_loaded();
+
+        // Bootstrap, catalog refresh, explicit off, then on again. An absent
+        // tier is authoritative Standard, not an invitation to use the saved
+        // default or preserve a stale priority badge.
+        for tier in [Some("priority"), Some("priority"), None, Some("priority")] {
+            let history = serde_json::from_value(serde_json::json!({
+                "type": "history",
+                "id": 1,
+                "session_id": "session_fast_status",
+                "messages": [],
+                "provider_name": "OpenAI",
+                "provider_model": "gpt-future-model",
+                "service_tier": tier
+            }))
+            .expect("history fixture");
+            app.handle_server_event(history, &mut remote);
+            assert_eq!(app.remote_service_tier.as_deref(), tier);
+            assert_eq!(
+                crate::tui::TuiState::info_widget_data(&app)
+                    .service_tier
+                    .as_deref(),
+                tier
+            );
+
+            app.input = "/fast status".to_string();
+            rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+                .expect("fast status");
+            let status = &app
+                .display_messages()
+                .last()
+                .expect("status message")
+                .content;
+            let expected = if tier.is_some() {
+                "Fast mode is on."
+            } else {
+                "Fast mode is off."
+            };
+            assert!(status.starts_with(expected), "{status}");
+        }
+    });
+}
+
+#[test]
 fn test_remote_debug_frame_commands_request_a_fresh_draw() {
     for command in [
         "frame",
@@ -436,6 +488,7 @@ fn openai_oauth_route(model: &str) -> crate::provider::ModelRoute {
         api_method: "openai-oauth".to_string(),
         available: true,
         detail: String::new(),
+        usage: None,
         cheapness: None,
     }
 }
@@ -447,6 +500,7 @@ fn claude_oauth_route(model: &str) -> crate::provider::ModelRoute {
         api_method: "claude-oauth".to_string(),
         available: true,
         detail: String::new(),
+        usage: None,
         cheapness: None,
     }
 }
@@ -737,6 +791,7 @@ fn test_guardrail_reroute_prefers_native_anthropic_route() {
             api_method: "openrouter".to_string(),
             available: true,
             detail: String::new(),
+            usage: None,
             cheapness: None,
         },
         claude_oauth_route("claude-opus-4-8"),
@@ -1202,6 +1257,29 @@ fn test_tui_login_providers_have_real_tui_handlers() {
             );
         }
     }
+}
+
+#[test]
+fn test_tui_grok_build_login_starts_managed_oauth_flow() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.start_login_provider(crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER);
+
+    assert!(matches!(
+        app.pending_login,
+        Some(PendingLogin::GrokBuild)
+    ));
+    let rendered = app
+        .display_messages()
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("xAI sign-in URL and device code"));
+    assert!(rendered.contains("You do not need to install the Grok CLI"));
+    assert!(!rendered.contains("run `jcode login"));
 }
 
 #[test]

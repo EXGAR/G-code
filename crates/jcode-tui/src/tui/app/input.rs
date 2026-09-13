@@ -311,6 +311,9 @@ fn image_content(media_type: String, base64_data: String) -> ClipboardPasteConte
 }
 
 fn download_image_url_content(url: &str) -> Option<ClipboardPasteContent> {
+    if crate::tui::is_ssh_remote() {
+        return None;
+    }
     super::download_image_url(url)
         .map(|(media_type, base64_data)| image_content(media_type, base64_data))
 }
@@ -381,6 +384,33 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_clipboard_image_bytes_work_without_local_file_or_url_fetch() {
+        if crate::tui::app::commands_dispatch::ssh_test_runs_in_child(
+            "ssh_clipboard_image_bytes_work_without_local_file_or_url_fetch",
+        ) {
+            return;
+        }
+        let content = super::read_clipboard_for_paste_with(
+            &super::ClipboardPasteKind::Smart,
+            || None,
+            || Some(("image/png".to_string(), "aW1hZ2U=".to_string())),
+            |_| panic!("clipboard image bytes must not fetch a URL"),
+        );
+        assert!(matches!(
+            content,
+            super::ClipboardPasteContent::Image { .. }
+        ));
+        assert!(super::download_image_url_content("http://127.0.0.1/secret.png").is_none());
+        let content = super::read_clipboard_for_paste_with(
+            &super::ClipboardPasteKind::Smart,
+            || Some("http://127.0.0.1/secret.png".to_string()),
+            || panic!("text must stay text"),
+            super::download_image_url_content,
+        );
+        assert!(matches!(content, super::ClipboardPasteContent::Text(_)));
+    }
+
     use super::{
         ClipboardPasteContent, ClipboardPasteKind, dropped_image_files,
         is_clipboard_paste_shortcut, parse_dropped_paths, preferred_wayland_text_type,
@@ -624,7 +654,17 @@ pub(in crate::tui::app) use paste_guard::expire_for_test as paste_guard_expire_f
 use paste_guard::image_media_type;
 
 pub(super) fn handle_paste(app: &mut App, text: String) {
+    if app.append_ssh_login_input(&text) {
+        return;
+    }
     paste_guard::note_paste();
+    if crate::tui::is_ssh_remote() {
+        // Text paths refer to the remote machine. Do not stat/read laptop
+        // files or download image URLs automatically while attached over SSH.
+        handle_text_paste(app, text);
+        app.set_status_notice("SSH paste: text only. File paths refer to the remote host; paste image bytes from the clipboard to attach an image.");
+        return;
+    }
     // Note: clipboard_image() is NOT checked here. Bracketed paste events from the
     // terminal always deliver text. Checking clipboard_image() here caused a bug where
     // text pastes were misidentified as images when the clipboard also had image data
@@ -736,6 +776,9 @@ pub(super) fn promote_dropped_images(app: &mut App) -> bool {
 }
 
 pub(super) fn parse_dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
+    if crate::tui::is_ssh_remote() {
+        return None;
+    }
     let trimmed = text.trim();
     let literal_path = PathBuf::from(trimmed);
     if literal_path.is_file() {
@@ -801,15 +844,54 @@ pub(super) fn handle_text_paste(app: &mut App, text: String) {
     let line_count = text.lines().count().max(1);
     if line_count < 5 {
         insert_input_text(app, &text);
-    } else {
-        app.pasted_contents.push(text);
-        let placeholder = format!(
-            "[pasted {} line{}]",
-            line_count,
-            if line_count == 1 { "" } else { "s" }
-        );
-        insert_input_text(app, &placeholder);
+        return;
     }
+    if expand_matching_paste(app, &text) {
+        return;
+    }
+
+    let placeholder = paste_placeholder(&text);
+    app.pasted_contents.push(text);
+    insert_input_text(app, &placeholder);
+}
+
+fn expand_matching_paste(app: &mut App, text: &str) -> bool {
+    let Some(content_index) = app
+        .pasted_contents
+        .iter()
+        .rposition(|content| content == text)
+    else {
+        return false;
+    };
+
+    let placeholder = paste_placeholder(text);
+    // Placeholders only encode a line count. Skip placeholders belonging to
+    // newer stored pastes with the same shape so equal-length, different text
+    // cannot cause the wrong placeholder to expand.
+    let newer_same_placeholder_count = app.pasted_contents[content_index + 1..]
+        .iter()
+        .filter(|content| paste_placeholder(content) == placeholder)
+        .count();
+    let Some(placeholder_start) = app
+        .input
+        .rmatch_indices(placeholder.as_str())
+        .map(|(position, _)| position)
+        .nth(newer_same_placeholder_count)
+    else {
+        return false;
+    };
+
+    app.follow_chat_bottom_for_typing();
+    app.remember_input_undo_state();
+    app.input.replace_range(
+        placeholder_start..placeholder_start + placeholder.len(),
+        text,
+    );
+    app.cursor_pos = placeholder_start + text.len();
+    app.pasted_contents.remove(content_index);
+    app.reset_tab_completion();
+    app.sync_model_picker_preview_from_input();
+    true
 }
 
 impl App {
@@ -1068,6 +1150,9 @@ pub(super) fn insert_input_text(app: &mut App, text: &str) {
 }
 
 pub(super) fn handle_text_input(app: &mut App, text: &str) -> bool {
+    if app.append_ssh_login_input(text) {
+        return true;
+    }
     if text.is_empty() {
         return false;
     }
@@ -1598,6 +1683,8 @@ impl App {
                 // leave incomplete todos would never be poked. Stay armed and
                 // simply do nothing this turn.
                 crate::logging::info("AUTO_POKE_DECISION action=idle reason=no_todos incomplete=0");
+                self.todo_final_response_requested = false;
+                self.last_todo_ownership_fingerprint = None;
                 return false;
             }
             // Deferred quality checks land here, once, instead of interrupting
@@ -1613,7 +1700,23 @@ impl App {
                 !crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
             let gate_budget_left =
                 self.todo_completion_gate_attempts < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
+            let ownership_fingerprint =
+                serde_json::to_string(&(&todo_session_id, &todos, &goals)).ok();
+            if ownership_needs_followup
+                && ownership_fingerprint.is_some()
+                && self.last_todo_ownership_fingerprint == ownership_fingerprint
+            {
+                // The agent has already had a chance to address this exact
+                // assessment. Leave the honest scores intact and stop, rather
+                // than buying another turn that only repeats the final answer.
+                // Do not fall through to the successful-completion handoff.
+                crate::logging::info(
+                    "AUTO_POKE_DECISION action=idle reason=unchanged_ownership_assessment",
+                );
+                return false;
+            }
             if ownership_needs_followup && gate_budget_left {
+                self.last_todo_ownership_fingerprint = ownership_fingerprint;
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
                 crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
@@ -1645,7 +1748,7 @@ impl App {
                     crate::telemetry::record_todo_gate(
                         crate::telemetry::TodoGateKind::ConfidenceSpike,
                     );
-                    "🔍 Double-checking a confidence jump for you..."
+                    "🔍 Double-checking confidence jumps..."
                 };
                 self.push_display_message(DisplayMessage::system(notice));
                 // User-role content: reminder-only turns read as empty user
@@ -1683,20 +1786,32 @@ impl App {
             // it stays armed so the next batch of work is covered too; only an
             // explicit /poke off (or a circuit breaker above) disarms it.
             self.auto_poke_incomplete_todos = self.auto_poke_default_on;
-            self.todo_confidence_spike_challenged = false;
             // A finished cycle re-arms the review for whatever work comes next;
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
             self.todo_completion_gate_attempts = 0;
-            self.push_display_message(DisplayMessage::system(format!(
-                "✅ All todos done. Completion confidence: {}.",
-                confidence_label
-            )));
+            if !self.todo_final_response_requested {
+                self.todo_final_response_requested = true;
+                self.push_display_message(DisplayMessage::system(format!(
+                    "✅ All todos done. Completion confidence: {}.",
+                    confidence_label
+                )));
+                self.queued_messages
+                    .push(crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string());
+                self.pending_queued_dispatch = true;
+                return true;
+            }
             self.pending_queued_dispatch = false;
             return false;
         }
 
         let poke_message = super::commands::build_poke_message(&incomplete);
+        self.todo_final_response_requested = false;
+        // Open work begins a new completion cycle. Keep the prior spike check
+        // latched until this point so the synthetic final-response turn cannot
+        // retrigger the same evidence gate against unchanged completed todos.
+        self.todo_confidence_spike_challenged = false;
+        self.last_todo_ownership_fingerprint = None;
         let fingerprint =
             serde_json::to_string(&incomplete).unwrap_or_else(|_| poke_message.clone());
         if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint) {
@@ -1739,6 +1854,9 @@ impl App {
     }
 
     pub(crate) fn toggle_next_prompt_new_session_routing(&mut self) {
+        if super::commands_dispatch::ssh_local_action_blocked(self, "New-session routing") {
+            return;
+        }
         self.route_next_prompt_to_new_session = !self.route_next_prompt_to_new_session;
         if self.route_next_prompt_to_new_session {
             self.set_status_notice("Next prompt → new session");
@@ -1780,6 +1898,9 @@ impl App {
 
     /// Spawn a brand-new jcode session in a new terminal window.
     pub(crate) fn handle_new_terminal_hotkey(&mut self) {
+        if super::commands_dispatch::ssh_local_action_blocked(self, "Opening a sibling terminal") {
+            return;
+        }
         let cwd = commands::active_working_dir(self)
             .filter(|path| path.is_dir())
             .or_else(|| std::env::current_dir().ok())
@@ -1818,6 +1939,9 @@ fn input_routes_to_new_session(app: &App) -> bool {
 fn route_prompt_to_new_session_local(app: &mut App) -> bool {
     if !input_routes_to_new_session(app) {
         return false;
+    }
+    if super::commands_dispatch::ssh_local_action_blocked(app, "Local new-session routing") {
+        return true;
     }
 
     app.route_next_prompt_to_new_session = false;
@@ -1907,10 +2031,6 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('s') => {
             app.toggle_input_stash();
-            true
-        }
-        KeyCode::Char('p') => {
-            super::commands::toggle_auto_poke_hotkey_local(app);
             true
         }
         KeyCode::Char('v') => {
@@ -2239,6 +2359,10 @@ pub(super) fn handle_pre_control_shortcuts(
 
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    if app.toggle_keys.auto_poke.matches(code, modifiers) {
+        super::commands::toggle_auto_poke_hotkey_local(app);
+        return true;
+    }
     if app.toggle_keys.copy_selection.matches(code, modifiers) {
         app.toggle_copy_selection_mode();
         return true;
@@ -2275,6 +2399,9 @@ pub(super) fn handle_pre_control_shortcuts(
         return true;
     }
     if app.dictation_key_matches(code, modifiers) {
+        if super::commands_dispatch::ssh_local_action_blocked(app, "Dictation setup") {
+            return true;
+        }
         app.handle_dictation_trigger();
         return true;
     }
@@ -2440,7 +2567,7 @@ fn handle_inline_image_toggle_shortcut(app: &mut App, key: char) -> bool {
     true
 }
 
-fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
+pub(super) fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
     if !key.eq_ignore_ascii_case(&'e') {
         return false;
     }
@@ -2489,18 +2616,7 @@ pub(super) fn handle_modal_key(
         return Ok(true);
     }
 
-    if app.changelog_scroll.is_some() {
-        app.handle_changelog_key(code)?;
-        return Ok(true);
-    }
-
-    if app.help_scroll.is_some() {
-        app.handle_help_key(code)?;
-        return Ok(true);
-    }
-
-    if app.model_status_scroll.is_some() {
-        app.handle_model_status_key(code)?;
+    if handle_scroll_overlay_key(app, code)? {
         return Ok(true);
     }
 
@@ -2510,11 +2626,19 @@ pub(super) fn handle_modal_key(
     }
 
     if app.login_picker_overlay.is_some() {
+        if super::commands_dispatch::ssh_local_action_blocked(app, "Local login picker") {
+            app.login_picker_overlay = None;
+            return Ok(true);
+        }
         app.handle_login_picker_key(code, modifiers)?;
         return Ok(true);
     }
 
     if app.account_picker_overlay.is_some() {
+        if super::commands_dispatch::ssh_local_action_blocked(app, "Local account picker") {
+            app.account_picker_overlay = None;
+            return Ok(true);
+        }
         if let Some(command) = app.next_account_picker_action(code, modifiers)? {
             app.handle_account_picker_command(command);
         }
@@ -2558,6 +2682,25 @@ pub(super) fn handle_modal_key(
     }
 
     Ok(false)
+}
+
+pub(super) fn handle_scroll_overlay_key(app: &mut App, code: KeyCode) -> Result<bool> {
+    // This overlay seam is shared by local/replay and live remote clients.
+    if app.panel_image_preview.is_some() {
+        if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+            app.close_panel_image_preview();
+        }
+    } else if app.changelog_scroll.is_some() {
+        app.handle_changelog_key(code)?;
+    } else if app.help_scroll.is_some() {
+        app.handle_help_key(code)?;
+    } else if app.model_status_scroll.is_some() {
+        app.handle_model_status_key(code)?;
+    } else {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 pub(super) fn handle_global_control_shortcuts(
@@ -2787,6 +2930,12 @@ fn paste_placeholder(content: &str) -> String {
 
 impl App {
     pub(super) fn handle_key_event(&mut self, event: crossterm::event::KeyEvent) {
+        if self.remote_login.is_some() {
+            if matches!(event.kind, crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat) {
+                let _ = self.handle_key_press_event(event);
+            }
+            return;
+        }
         // Record the event if recording is active
         use crate::tui::test_harness::{TestEvent, record_event};
         let modifiers: Vec<String> = {
@@ -2845,9 +2994,16 @@ impl App {
         let mut modifiers = modifiers;
         ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
 
+        if self.handle_ssh_login_key(code, modifiers, text_input.as_deref()) {
+            return Ok(());
+        }
+
         // Alt+5 always starts the onboarding simulator from a pristine first
         // screen, even when another modal or a previous sim screen is active.
         if self.handle_onboarding_sim_reset_shortcut(code, modifiers) {
+            return Ok(());
+        }
+        if self.handle_update_sim_shortcut(code, modifiers) {
             return Ok(());
         }
 
@@ -3082,6 +3238,9 @@ impl App {
     }
 
     pub(super) fn update_copy_badge_key_event(&mut self, event: crossterm::event::KeyEvent) {
+        if self.remote_login.is_some() {
+            return;
+        }
         use crossterm::event::{KeyCode, KeyEventKind, ModifierKeyCode};
 
         self.prune_copy_badge_ui();
@@ -3573,6 +3732,21 @@ impl App {
 
     /// Submit input - just sets up message and flags, processing happens in next loop iteration
     pub(super) fn submit_input(&mut self) {
+        // Connected SSH input is dispatched through the wire client, never the
+        // local submit fallback (which reads skills and persists prompts).
+        if crate::tui::is_ssh_remote() {
+            let input = self.input.clone();
+            if super::commands_dispatch::dispatch_local_command(self, input.trim()) {
+                self.input.clear();
+                self.cursor_pos = 0;
+            } else {
+                super::commands_dispatch::ssh_local_action_blocked(
+                    self,
+                    "Local submission fallback",
+                );
+            }
+            return;
+        }
         promote_dropped_images(self);
         if self.activate_picker_from_preview() {
             return;
@@ -3728,7 +3902,8 @@ impl App {
         // Leaving the preview should happen as soon as the user acts on it.
         self.onboarding_preview_mode = false;
 
-        // Add user message to display (show placeholder to user, not full paste)
+        // Add the expanded user message to the transcript. The composer remains compact
+        // while editing, but sent turns should show the actual pasted content.
         // Remember the typed prompt so we can restore it to the input box if this
         // turn fails (e.g. "token refresh needed"), instead of dropping it.
         self.last_submitted_input = Some(raw_input.clone());
@@ -3741,7 +3916,7 @@ impl App {
 
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
-            content: raw_input, // Show placeholder to user (condensed view)
+            content: input.clone(),
             tool_calls: vec![],
             duration_secs: None,
             title: None,

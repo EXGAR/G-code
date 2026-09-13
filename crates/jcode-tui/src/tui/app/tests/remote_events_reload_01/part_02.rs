@@ -184,7 +184,7 @@ fn test_remote_auto_poke_challenges_abrupt_confidence_increase() {
         assert!(
             app.display_messages()
                 .iter()
-                .any(|msg| { msg.content.contains("Double-checking a confidence jump") })
+                .any(|msg| { msg.content.contains("Double-checking confidence jumps") })
         );
     });
 }
@@ -354,6 +354,7 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
             id: 1,
             session_id: "session_rewind_remote".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
+                response_stats: None,
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 tool_calls: None,

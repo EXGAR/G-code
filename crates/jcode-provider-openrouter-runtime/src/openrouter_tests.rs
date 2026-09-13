@@ -356,7 +356,7 @@ fn named_openai_compatible_provider_uses_per_model_image_input_support() {
 }
 
 #[test]
-fn named_openai_compatible_model_with_omitted_input_defaults_to_text_only() {
+fn named_openai_compatible_model_with_omitted_input_preserves_image_support() {
     let _lock = ENV_LOCK.lock();
     let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
 
@@ -366,6 +366,7 @@ fn named_openai_compatible_model_with_omitted_input_defaults_to_text_only() {
         default_model: Some("text-model".to_string()),
         models: vec![jcode_base::config::NamedProviderModelConfig {
             id: "text-model".to_string(),
+            context_window: Some(200_000),
             ..Default::default()
         }],
         ..Default::default()
@@ -374,11 +375,11 @@ fn named_openai_compatible_model_with_omitted_input_defaults_to_text_only() {
     let provider = OpenRouterProvider::new_named_openai_compatible("local-compat", &profile)
         .expect("local named profile should initialize without auth");
 
-    assert!(!provider.supports_image_input());
+    assert!(provider.supports_image_input());
 }
 
 #[test]
-fn named_openai_compatible_model_with_empty_input_defaults_to_text_only() {
+fn named_openai_compatible_model_with_empty_input_preserves_image_support() {
     let _lock = ENV_LOCK.lock();
     let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
 
@@ -388,6 +389,8 @@ fn named_openai_compatible_model_with_empty_input_defaults_to_text_only() {
         default_model: Some("text-model".to_string()),
         models: vec![jcode_base::config::NamedProviderModelConfig {
             id: "text-model".to_string(),
+            reasoning: None,
+            reasoning_effort: None,
             input: Vec::new(),
             ..Default::default()
         }],
@@ -397,13 +400,24 @@ fn named_openai_compatible_model_with_empty_input_defaults_to_text_only() {
     let provider = OpenRouterProvider::new_named_openai_compatible("local-compat", &profile)
         .expect("local named profile should initialize without auth");
 
-    assert!(!provider.supports_image_input());
+    assert!(provider.supports_image_input());
 }
 
 #[test]
 fn direct_deepseek_profile_does_not_advertise_image_input_support() {
     let provider = OpenRouterProvider {
         profile_id: Some("deepseek".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert!(!provider.supports_image_input());
+}
+
+#[test]
+fn direct_zai_profile_does_not_advertise_image_input_support() {
+    let provider = OpenRouterProvider {
+        profile_id: Some("zai".to_string()),
         supports_provider_features: false,
         ..make_custom_compatible_provider()
     };
@@ -1268,12 +1282,15 @@ fn make_provider() -> OpenRouterProvider {
         supports_model_catalog: true,
         profile_id: None,
         reasoning_effort_support: None,
+        disable_reasoning_heuristics: false,
+        static_reasoning_config: HashMap::new(),
         max_tokens: None,
         extra_body: None,
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
         static_image_input_support: HashMap::new(),
         send_openrouter_headers: true,
+        conversation_id: new_conversation_id(),
         models_cache: Arc::new(RwLock::new(ModelsCache::default())),
         model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
         endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
@@ -1297,12 +1314,15 @@ fn make_custom_compatible_provider() -> OpenRouterProvider {
         supports_model_catalog: true,
         profile_id: None,
         reasoning_effort_support: None,
+        disable_reasoning_heuristics: false,
+        static_reasoning_config: HashMap::new(),
         max_tokens: None,
         extra_body: None,
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
         static_image_input_support: HashMap::new(),
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         models_cache: Arc::new(RwLock::new(ModelsCache::default())),
         model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
         endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
@@ -1393,6 +1413,46 @@ fn direct_deepseek_profile_exposes_max_reasoning_effort() {
         .set_reasoning_effort("max")
         .expect("DeepSeek direct profile should accept max effort");
     assert_eq!(provider.reasoning_effort().as_deref(), Some("max"));
+}
+
+#[test]
+fn direct_zai_profile_exposes_openai_reasoning_effort_ladder() {
+    let provider = OpenRouterProvider {
+        profile_id: Some("zai".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        provider.available_efforts(),
+        jcode_provider_core::OPENAI_SELECTABLE_EFFORTS
+    );
+    provider
+        .set_reasoning_effort("xhigh")
+        .expect("Z.AI Coding Plan should accept xhigh effort");
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+}
+
+#[test]
+fn direct_zai_profile_applies_configured_effort_on_construction_and_model_switch() {
+    let configured = jcode_base::config::config()
+        .provider
+        .openai_reasoning_effort
+        .as_deref()
+        .and_then(OpenRouterProvider::normalize_openai_reasoning_effort);
+    assert_eq!(
+        OpenRouterProvider::initial_reasoning_effort(None, Some("zai")),
+        configured
+    );
+
+    let provider = OpenRouterProvider {
+        profile_id: Some("zai".to_string()),
+        supports_provider_features: false,
+        reasoning_effort: Arc::new(RwLock::new(None)),
+        ..make_custom_compatible_provider()
+    };
+    provider.set_model("glm-5.3-flash").unwrap();
+    assert_eq!(provider.reasoning_effort(), configured);
 }
 
 #[test]
@@ -1634,6 +1694,7 @@ fn direct_deepseek_chat_request_sends_reasoning_effort() {
         supports_provider_features: false,
         supports_model_catalog: false,
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
     provider
@@ -1690,6 +1751,7 @@ fn direct_openai_compatible_chat_request_preserves_max_reasoning_effort() {
         supports_provider_features: false,
         supports_model_catalog: false,
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
     provider
@@ -1759,6 +1821,7 @@ fn openai_compatible_model_catalog_refresh_calls_models_endpoint_and_updates_dis
         reasoning_effort_support: None,
         static_models: vec!["static-login-flow-fallback".to_string()],
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
 
@@ -1808,6 +1871,7 @@ fn openai_compatible_model_catalog_refresh_calls_models_endpoint_and_updates_dis
         profile_id: None,
         reasoning_effort_support: None,
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
     assert_eq!(fresh_provider.context_window(), 131_072);
@@ -1844,6 +1908,7 @@ fn built_in_openai_compatible_static_models_drop_out_after_live_catalog() {
         profile_id: Some("cerebras".to_string()),
         static_models: vec!["gpt-oss-120b".to_string(), "zai-glm-4.7".to_string()],
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
 
@@ -1873,6 +1938,7 @@ fn direct_openai_compatible_static_models_are_marked_as_fallback_before_live_cat
         profile_id: Some("opencode".to_string()),
         static_models: vec!["minimax-m2.7".to_string()],
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
 
@@ -1898,6 +1964,7 @@ fn cerebras_live_catalog_models_are_selectable_on_explicit_switch() {
         profile_id: Some("cerebras".to_string()),
         static_models: vec!["gpt-oss-120b".to_string()],
         send_openrouter_headers: false,
+        conversation_id: new_conversation_id(),
         ..make_custom_compatible_provider()
     };
 
@@ -1927,6 +1994,26 @@ fn direct_deepseek_profile_uses_static_1m_context_when_catalog_is_absent() {
 }
 
 #[test]
+fn explicit_cached_context_window_precedes_zai_family_fallback() {
+    let model = "glm-5.3-issue-1087";
+    jcode_base::provider::populate_context_limits(HashMap::from([(model.to_string(), 1_000_000)]));
+    let provider = OpenRouterProvider {
+        model: Arc::new(RwLock::new(model.to_string())),
+        profile_id: Some("zai".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        jcode_base::provider_catalog::openai_compatible_profile_context_limit("zai", model),
+        Some(200_000),
+        "the regression requires a conflicting static family guess"
+    );
+    assert_eq!(provider.context_window(), 1_000_000);
+}
+
+#[test]
 fn named_openai_compatible_model_context_window_overrides_default() {
     let _lock = ENV_LOCK.lock();
     let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
@@ -1937,6 +2024,8 @@ fn named_openai_compatible_model_context_window_overrides_default() {
         models: vec![jcode_base::config::NamedProviderModelConfig {
             id: "custom-long-context".to_string(),
             context_window: Some(512_000),
+            reasoning: None,
+            reasoning_effort: None,
             input: Vec::new(),
         }],
         ..Default::default()
@@ -1964,6 +2053,8 @@ fn named_profile_context_window_survives_provider_qualified_model() {
         models: vec![jcode_base::config::NamedProviderModelConfig {
             id: "qwen3.6-35b-a2000-128k".to_string(),
             context_window: Some(131_072),
+            reasoning: None,
+            reasoning_effort: None,
             input: Vec::new(),
         }],
         ..Default::default()
@@ -2821,6 +2912,7 @@ fn midstream_transport_fault_emits_retry_rollback_before_replay() {
                 label: "test".to_string(),
             },
             false,
+            new_conversation_id(),
             request,
             tx,
             Arc::new(Mutex::new(None)),
@@ -3052,6 +3144,66 @@ fn named_profile_construction_reads_openai_reasoning_effort_config() {
         .expect("explicitly-enabled profile accepts effort");
 }
 
+#[test]
+fn named_profile_can_disable_reasoning_model_name_heuristics() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let config = jcode_base::config::NamedProviderConfig {
+        base_url: "https://compat.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("gpt-5.5-enterprise".to_string()),
+        disable_reasoning_heuristics: true,
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("enterprise", &config).unwrap();
+    assert!(provider.available_efforts().is_empty());
+    assert!(provider.set_reasoning_effort("high").is_err());
+}
+
+#[test]
+fn named_profile_model_reasoning_overrides_capability_and_default_effort() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let config = jcode_base::config::NamedProviderConfig {
+        base_url: "https://compat.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("reasoning-custom".to_string()),
+        disable_reasoning_heuristics: true,
+        models: vec![
+            jcode_base::config::NamedProviderModelConfig {
+                id: "reasoning-custom".to_string(),
+                reasoning: Some(true),
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            jcode_base::config::NamedProviderModelConfig {
+                id: "gpt-5-disabled".to_string(),
+                reasoning: Some(false),
+                ..Default::default()
+            },
+            jcode_base::config::NamedProviderModelConfig {
+                id: "reasoning-mini".to_string(),
+                reasoning: Some(true),
+                reasoning_effort: Some("low".to_string()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("custom", &config).unwrap();
+    assert_eq!(provider.reasoning_effort(), Some("high".to_string()));
+    assert!(provider.available_efforts().contains(&"xhigh"));
+
+    provider.set_model("gpt-5-disabled").unwrap();
+    assert!(provider.available_efforts().is_empty());
+    assert_eq!(provider.reasoning_effort(), None);
+
+    provider.set_model("reasoning-mini").unwrap();
+    assert_eq!(provider.reasoning_effort(), Some("low".to_string()));
+}
+
 /// Regression: when the shared interactive server boots an `OpenRouterProvider`
 /// without binding `profile_id` (the deferred-auth bootstrap path used by the
 /// TUI server), a session-routing `<name>:` prefix for a *user-defined* named
@@ -3177,4 +3329,124 @@ fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name()
     // User-facing identity: the profile the user configured.
     assert_eq!(provider.runtime_display_name(), "example-compat");
     assert_eq!(Provider::display_name(&provider), "example-compat");
+}
+
+/// Issue #1167: OpenCode Go/Zen require a stable per-conversation
+/// `x-opencode-session` header; other OpenAI-compatible hosts must not get it.
+#[test]
+fn opencode_session_header_only_for_opencode_hosts() {
+    assert!(is_opencode_api_base("https://opencode.ai/zen/go/v1"));
+    assert!(is_opencode_api_base("https://opencode.ai/zen/v1"));
+    assert!(is_opencode_api_base("https://api.opencode.ai/v1"));
+    assert!(!is_opencode_api_base("https://openrouter.ai/api/v1"));
+    assert!(!is_opencode_api_base("https://api.deepseek.com/v1"));
+    assert!(!is_opencode_api_base("not a url"));
+
+    let client = reqwest::Client::new();
+    let req = apply_opencode_session_header(
+        client.post("https://opencode.ai/zen/go/v1/chat/completions"),
+        "https://opencode.ai/zen/go/v1",
+        "conv-123",
+    )
+    .build()
+    .unwrap();
+    assert_eq!(
+        req.headers()
+            .get(OPENCODE_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("conv-123")
+    );
+
+    let req = apply_opencode_session_header(
+        client.post("https://openrouter.ai/api/v1/chat/completions"),
+        "https://openrouter.ai/api/v1",
+        "conv-123",
+    )
+    .build()
+    .unwrap();
+    assert!(req.headers().get(OPENCODE_SESSION_HEADER).is_none());
+}
+
+#[test]
+fn opencode_session_ids_are_uuids_and_unique() {
+    let a = new_conversation_id();
+    let b = new_conversation_id();
+    assert_ne!(a, b);
+    assert!(uuid::Uuid::parse_str(&a).is_ok());
+}
+
+/// Wire-level check for issue #1167: a real `chat/completions` request whose
+/// api_base host is `opencode.ai` carries `x-opencode-session`, and a
+/// request to another host does not. The DNS override points the hostname at
+/// a local listener, so the full stream path (including retries) is exercised.
+fn spawn_header_capturing_server() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = vec![0u8; 65536];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    (addr, rx)
+}
+
+fn captured_request_for_host(host: &str, conversation_id: &str) -> String {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let (addr, rx) = spawn_header_capturing_server();
+        let client = reqwest::Client::builder()
+            .resolve(host, addr)
+            .build()
+            .expect("client");
+        let api_base = format!("http://{host}:{}/zen/go/v1", addr.port());
+        let (tx, mut events) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(64);
+        super::openrouter_sse_stream::run_stream_with_retries(
+            client,
+            api_base,
+            ProviderAuth::None {
+                label: "test".to_string(),
+            },
+            false,
+            conversation_id.to_string(),
+            serde_json::json!({"model": "m", "messages": [], "stream": true}),
+            tx,
+            Arc::new(Mutex::new(None)),
+            "m".to_string(),
+        )
+        .await;
+        while events.recv().await.is_some() {}
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("server captured request")
+    })
+}
+
+#[test]
+fn opencode_session_header_is_sent_on_the_wire_only_to_opencode_hosts() {
+    let raw = captured_request_for_host("opencode.ai", "conv-wire-1167").to_ascii_lowercase();
+    assert!(
+        raw.contains("x-opencode-session: conv-wire-1167"),
+        "opencode.ai request lacked the header:\n{raw}"
+    );
+
+    let raw = captured_request_for_host("example.test", "conv-wire-1167").to_ascii_lowercase();
+    assert!(
+        !raw.contains("x-opencode-session"),
+        "non-opencode host received the header:\n{raw}"
+    );
 }

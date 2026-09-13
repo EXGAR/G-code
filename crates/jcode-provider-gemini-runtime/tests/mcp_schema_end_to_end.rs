@@ -47,6 +47,7 @@ fn playwright_tool_definitions() -> Vec<ToolDefinition> {
         .tools
         .into_iter()
         .map(|tool| ToolDefinition {
+            execution_mode: None,
             name: format!("mcp__playwright__{}", tool.name),
             description: tool.description.unwrap_or_default(),
             input_schema: tool.input_schema,

@@ -8,7 +8,7 @@
  */
 
 export const API_VERSION_MAJOR = 1;
-export const API_VERSION_MINOR = 0;
+export const API_VERSION_MINOR = 3;
 
 export type PermissionDecision = "allow" | "allow_always" | "deny";
 
@@ -21,6 +21,12 @@ export type ErrorCode =
 
 export interface SessionInfo {
   session_id: string;
+  /** Swarm owner, never the transcript's ordinary fork parent. */
+  parent_session_id?: string;
+  /** Stable task/role label, separate from the canonical display title. */
+  agent_label?: string;
+  /** Last persisted swarm lifecycle status, not connection status. */
+  swarm_status?: string;
   working_dir?: string;
   title?: string;
   status: string;
@@ -30,12 +36,31 @@ export interface SessionInfo {
   archived_at_ms?: number;
 }
 
+/** Tracked turns with a persisted response, separate from historical picker selections. */
+export interface ModelUsage {
+  count: number;
+  last_used_unix_secs?: number | null;
+  tracking_started_unix_secs?: number | null;
+  selection_count: number;
+  last_selected_unix_secs?: number | null;
+}
+
+/** Best-first usage ordering. Apply search relevance first and stable identity last. */
+export function compareModelUsage(a?: ModelUsage | null, b?: ModelUsage | null): number {
+  if (!a || !b) return a ? -1 : b ? 1 : 0;
+  return b.count - a.count
+    || (b.last_used_unix_secs ?? -1) - (a.last_used_unix_secs ?? -1)
+    || b.selection_count - a.selection_count
+    || (b.last_selected_unix_secs ?? -1) - (a.last_selected_unix_secs ?? -1);
+}
+
 export interface ModelRouteInfo {
   model: string;
   provider: string;
   api_method: string;
   available: boolean;
   detail: string;
+  usage?: ModelUsage;
 }
 
 export interface TextMatch {
@@ -45,10 +70,42 @@ export interface TextMatch {
   preview: string;
 }
 
+/** Durable raw provider counts summed over all assistant rounds in one user turn.
+ * Missing metrics are unknown, not zero. Cache accounting differs by provider.
+ * Restored duration is currently unavailable. */
+export interface ResponseStats {
+  duration_secs?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+}
+
 export interface HistoryMessage {
+  /** Only on the final assistant row. Preview/old-server history may omit it. */
+  response_stats?: ResponseStats;
   /** "user" | "assistant" | "tool" */
   role: string;
   content: string;
+}
+
+export type RenderedImageSource =
+  | { kind: "user_input" }
+  | { kind: "tool_result"; tool_name: string }
+  | { kind: "other"; role: string };
+
+export type RenderedImageAnchor =
+  | { kind: "tool_call"; id: string }
+  | { kind: "user_prompt"; ordinal: number };
+
+export interface RenderedImage {
+  media_type: string;
+  data: string;
+  label?: string;
+  source: RenderedImageSource;
+  anchor?: RenderedImageAnchor;
+  /** Insert before this History.messages index (including hidden rows). Length means append. */
+  history_message_index?: number;
 }
 
 /** Base64 image attachment: [mediaType, base64Data]. */
@@ -56,12 +113,13 @@ export type ImageAttachment = [string, string];
 
 export type ApiRequest =
   | { req: "hello"; min_version: number; max_version: number; client: string }
-  | { req: "list_sessions"; include_archived?: boolean }
+  | { req: "list_sessions"; include_archived?: boolean; limit?: number }
   | { req: "archive_session"; session_id: string }
   | { req: "restore_session"; session_id: string }
   | { req: "set_retention_policy"; archive_after_days?: number }
   | { req: "create_session"; working_dir?: string }
   | { req: "attach_session"; session_id: string }
+  | { req: "fork_session"; session_id: string }
   | { req: "detach_session"; session_id: string }
   | {
       req: "send_message";
@@ -69,12 +127,14 @@ export type ApiRequest =
       content: string;
       images?: ImageAttachment[];
       no_reply?: boolean;
+      system_reminder?: string;
     }
   | { req: "cancel"; session_id: string }
   | {
       req: "soft_interrupt";
       session_id: string;
       content: string;
+      images?: ImageAttachment[];
       urgent?: boolean;
     }
   | { req: "get_history"; session_id: string }
@@ -90,6 +150,7 @@ export type ApiRequest =
   | { req: "list_models"; session_id: string }
   | { req: "get_runtime_info"; session_id: string }
   | { req: "set_api_key"; provider: string; api_key: string }
+  | { req: "notify_auth_changed"; provider: string }
   | { req: "clear_api_key"; provider: string }
   | { req: "read_file"; session_id: string; path: string; max_bytes?: number }
   | { req: "find_files"; session_id: string; query: string; limit?: number }
@@ -109,7 +170,8 @@ export type ApiEvent =
   | { ev: "error"; code: ErrorCode; message: string }
   | { ev: "sessions"; sessions: SessionInfo[] }
   | { ev: "attached"; session: SessionInfo }
-  | { ev: "history"; session_id: string; messages: HistoryMessage[] }
+  | { ev: "session_forked"; session: SessionInfo }
+  | { ev: "history"; session_id: string; messages: HistoryMessage[]; images?: RenderedImage[] }
   | { ev: "pong" }
   | { ev: "text_delta"; session_id: string; text: string }
   | { ev: "reasoning_delta"; session_id: string; text: string }
@@ -125,14 +187,22 @@ export type ApiEvent =
       output: string;
       error?: string;
     }
+  | { ev: "side_pane_images"; session_id: string; images: RenderedImage[] }
   | {
       ev: "token_usage";
       session_id: string;
       input: number;
       output: number;
       cache_read_input?: number;
+      cache_creation_input?: number;
     }
   | { ev: "turn_done"; session_id: string }
+  | {
+      ev: "wake_requested";
+      session_id: string;
+      reason: string;
+      notification: string;
+    }
   | {
       ev: "background_progress";
       session_id: string;
@@ -150,14 +220,24 @@ export type ApiEvent =
       tool_name: string;
       description: string;
     }
+  /** Attachment recovery intent. Can precede attached. Never auto-sent by the bridge. */
+  | { ev: "session_recovery"; session_id: string; continuation_message: string; reconnect_notice?: string }
   | { ev: "session_status"; session_id: string; status: string }
-  | { ev: "model_info"; session_id: string; provider?: string; model?: string }
+  | { ev: "connection_phase"; session_id: string; phase: string }
+  | {
+      ev: "model_info";
+      session_id: string;
+      provider?: string;
+      model?: string;
+      reasoning_effort?: string;
+    }
   | { ev: "models"; session_id: string; models: string[]; current?: string }
   | {
       ev: "runtime_info";
       session_id: string;
       provider?: string;
       model?: string;
+      reasoning_effort?: string;
       routes: ModelRouteInfo[];
     }
   | { ev: "credential_updated"; provider: string; configured: boolean }
@@ -225,7 +305,9 @@ export const KNOWN_EVENT_KINDS = [
   "error",
   "sessions",
   "attached",
+  "session_forked",
   "history",
+  "side_pane_images",
   "pong",
   "text_delta",
   "reasoning_delta",
@@ -236,10 +318,13 @@ export const KNOWN_EVENT_KINDS = [
   "tool_done",
   "token_usage",
   "turn_done",
+  "wake_requested",
   "background_progress",
   "message_accepted",
   "permission_request",
   "session_status",
+  "session_recovery",
+  "connection_phase",
   "model_info",
   "models",
   "runtime_info",
@@ -261,6 +346,7 @@ export const KNOWN_REQUEST_KINDS = [
   "set_retention_policy",
   "create_session",
   "attach_session",
+  "fork_session",
   "detach_session",
   "send_message",
   "cancel",
@@ -274,6 +360,7 @@ export const KNOWN_REQUEST_KINDS = [
   "get_runtime_info",
   "set_api_key",
   "clear_api_key",
+  "notify_auth_changed",
   "read_file",
   "find_files",
   "search_text",

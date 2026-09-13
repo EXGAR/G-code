@@ -27,6 +27,7 @@ import {
   type ImageAttachment,
   type ModelRouteInfo,
   type PermissionDecision,
+  type RenderedImage,
   type ServerFrame,
   type SessionInfo,
   type TextMatch,
@@ -411,12 +412,16 @@ export class JcodeClient extends EventEmitter {
 
   // --- Curated surface -----------------------------------------------------
 
-  async listSessions(options: { includeArchived?: boolean } = {}): Promise<SessionInfo[]> {
+  async listSessions(options: { includeArchived?: boolean; limit?: number } = {}): Promise<SessionInfo[]> {
     const frame = await this.expectReply(
-      { req: "list_sessions", include_archived: options.includeArchived },
+      { req: "list_sessions", include_archived: options.includeArchived, limit: options.limit },
       "sessions",
     );
     return frame.sessions ?? [];
+  }
+
+  async listSessionsLimited(limit: number): Promise<SessionInfo[]> {
+    return this.listSessions({ limit });
   }
 
   /** Reversibly hide a session from the default list. No transcript is deleted. */
@@ -445,6 +450,15 @@ export class JcodeClient extends EventEmitter {
     const frame = await this.expectReply(
       { req: "attach_session", session_id: sessionId },
       "attached",
+    );
+    return frame.session;
+  }
+
+  /** Clone a session's complete persisted context into a new idle session. */
+  async forkSession(sessionId: string): Promise<SessionInfo> {
+    const frame = await this.expectReply(
+      { req: "fork_session", session_id: sessionId },
+      "session_forked",
     );
     return frame.session;
   }
@@ -504,6 +518,11 @@ export class JcodeClient extends EventEmitter {
     await accepted;
   }
 
+  /** Submit a hidden recovery continuation without awaiting message acceptance. */
+  async sendSystemReminder(sessionId: string, reminder: string): Promise<void> {
+    this.notify({ req: "send_message", session_id: sessionId, content: "", system_reminder: reminder });
+  }
+
   /** Write a request without expecting a request-level reply. */
   notify(request: ApiRequest): void {
     if (this.closed) throw this.closeError ?? new Error("client closed");
@@ -540,15 +559,37 @@ export class JcodeClient extends EventEmitter {
   }
 
   async softInterrupt(sessionId: string, content: string, urgent = false): Promise<void> {
-    await this.requestOk({ req: "soft_interrupt", session_id: sessionId, content, urgent });
+    await this.softInterruptWithImages(sessionId, content, [], urgent);
+  }
+
+  async softInterruptWithImages(
+    sessionId: string,
+    content: string,
+    images: ImageAttachment[],
+    urgent = false,
+  ): Promise<void> {
+    await this.requestOk({
+      req: "soft_interrupt",
+      session_id: sessionId,
+      content,
+      images: images.length > 0 ? images : undefined,
+      urgent,
+    });
   }
 
   async getHistory(sessionId: string): Promise<HistoryMessage[]> {
+    const { messages } = await this.getHistoryWithImages(sessionId);
+    return messages;
+  }
+
+  async getHistoryWithImages(
+    sessionId: string,
+  ): Promise<{ messages: HistoryMessage[]; images: RenderedImage[] }> {
     const frame = await this.expectReply(
       { req: "get_history", session_id: sessionId },
       "history",
     );
-    return frame.messages ?? [];
+    return { messages: frame.messages ?? [], images: frame.images ?? [] };
   }
 
   async peekSession(sessionId: string, limit?: number): Promise<HistoryMessage[]> {
@@ -625,6 +666,11 @@ export class JcodeClient extends EventEmitter {
 
   async clearApiKey(provider: string): Promise<void> {
     await this.expectReply({ req: "clear_api_key", provider }, "credential_updated");
+  }
+
+  /** Reload credentials saved by an out-of-band OAuth login. No secrets or chat messages. */
+  async notifyAuthChanged(provider: string): Promise<void> {
+    await this.expectReply({ req: "notify_auth_changed", provider }, "ok");
   }
 
   async readFile(sessionId: string, path: string, maxBytes?: number): Promise<FileContent> {

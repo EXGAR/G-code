@@ -44,8 +44,10 @@ fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::TogetherAi.as_arg_value(), "togetherai");
     assert_eq!(ProviderChoice::Deepinfra.as_arg_value(), "deepinfra");
     assert_eq!(ProviderChoice::Fireworks.as_arg_value(), "fireworks");
+    assert_eq!(ProviderChoice::Novita.as_arg_value(), "novita");
     assert_eq!(ProviderChoice::Minimax.as_arg_value(), "minimax");
     assert_eq!(ProviderChoice::Xai.as_arg_value(), "xai");
+    assert_eq!(ProviderChoice::GrokBuild.as_arg_value(), "grok-build");
     assert_eq!(ProviderChoice::XiaomiMimo.as_arg_value(), "xiaomi-mimo");
     assert_eq!(ProviderChoice::MetaMuse.as_arg_value(), "meta-muse");
     assert_eq!(ProviderChoice::Celeris.as_arg_value(), "celeris");
@@ -67,6 +69,23 @@ fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::Antigravity.as_arg_value(), "antigravity");
     assert_eq!(ProviderChoice::Google.as_arg_value(), "google");
     assert_eq!(ProviderChoice::Auto.as_arg_value(), "auto");
+}
+
+#[test]
+fn novita_cli_aliases_select_the_builtin_profile() {
+    use clap::ValueEnum;
+    for input in ["novita", "novita-ai", "novita.ai"] {
+        let choice = ProviderChoice::from_str(input, false).unwrap();
+        assert_eq!(choice, ProviderChoice::Novita);
+        assert_eq!(
+            profile_for_choice(&choice),
+            Some(provider_catalog::NOVITA_PROFILE)
+        );
+        assert_eq!(
+            login_provider_for_choice(&choice),
+            Some(provider_catalog::NOVITA_LOGIN_PROVIDER)
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,6 +146,76 @@ async fn explicit_anthropic_api_choice_pins_api_key_over_available_oauth() {
     assert_eq!(
         std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
         Some("claude-api")
+    );
+
+    for (key, value) in saved {
+        if let Some(value) = value {
+            crate::env::set_var(key, value);
+        } else {
+            crate::env::remove_var(key);
+        }
+    }
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test env locks intentionally stay held across provider init to isolate process-global auth env"
+)]
+async fn explicit_openai_api_choice_overrides_configured_compatible_default() {
+    let _guard = lock_env();
+    let _env_guard = crate::storage::lock_test_env();
+    let dir = TempDir::new().expect("temp dir");
+    let keys = [
+        "JCODE_HOME",
+        "OPENAI_API_KEY",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_RUNTIME_PROVIDER",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+    ];
+    let saved: Vec<(&str, Option<String>)> = keys
+        .iter()
+        .map(|key| (*key, std::env::var(key).ok()))
+        .collect();
+
+    crate::env::set_var("JCODE_HOME", dir.path());
+    crate::env::set_var("OPENAI_API_KEY", "sk-openai-api-test");
+    for key in keys.iter().skip(2) {
+        crate::env::remove_var(key);
+    }
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+[provider]
+default_provider = "local-gateway"
+default_model = "gateway-default"
+
+[providers.local-gateway]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+auth = "none"
+default_model = "gateway-default"
+requires_api_key = false
+"#,
+    )
+    .expect("write competing configured provider default");
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
+
+    let provider = init_provider_for_validation(&ProviderChoice::OpenaiApi, Some("gpt-5.6-luna"))
+        .await
+        .expect("explicit OpenAI API provider should override configured defaults");
+
+    assert_eq!(provider.active_auth_method_label(), Some("API key"));
+    assert_eq!(provider.model(), "gpt-5.6-luna");
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("openai-api")
     );
 
     for (key, value) in saved {

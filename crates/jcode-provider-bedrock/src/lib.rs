@@ -250,6 +250,7 @@ impl BedrockProvider {
         jcode_provider_env::load_api_key_from_env_or_config(API_KEY_ENV, ENV_FILE)
     }
 
+    #[cfg(any(feature = "aws-sdk", test))]
     fn configured_bearer_token_for_runtime() -> Option<String> {
         Self::configured_profile()
             .is_none()
@@ -1428,6 +1429,7 @@ impl Provider for BedrockProvider {
                                 .join(" · ")
                         )
                     },
+                    usage: None,
                     cheapness: Self::route_pricing(&model),
                 }
             })

@@ -8,6 +8,25 @@ pub struct ContextSnapshot {
     pub fresh: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskRowStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Compact presentation state for one retained background task.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundTaskRow {
+    pub task_id: String,
+    pub label: String,
+    pub percent: Option<f32>,
+    pub status: BackgroundTaskRowStatus,
+    /// When a successful task stopped being actionable. Running and failed
+    /// tasks remain visible until their state changes or the session closes.
+    pub completed_at: Option<std::time::Instant>,
+}
+
 pub mod backend;
 pub(crate) mod color_support;
 mod core;
@@ -94,6 +113,7 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
 
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
 /// Enable Kitty keyboard protocol for unambiguous key reporting.
@@ -126,6 +146,80 @@ pub fn disable_keyboard_enhancement() {
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags
     );
+}
+
+/// Reassert terminal modes that terminals may clear while the TUI remains alive.
+///
+/// These commands are idempotent. Kitty keyboard enhancement uses its `set`
+/// form rather than the stack-based `push`, keeping the shutdown pop balanced.
+pub(crate) fn reapply_terminal_modes_to(
+    writer: &mut impl std::io::Write,
+    mouse_capture: bool,
+    keyboard_enhanced: bool,
+    focus_change: bool,
+) -> std::io::Result<()> {
+    use crossterm::QueueableCommand;
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
+
+    writer.queue(EnableBracketedPaste)?;
+    if focus_change {
+        writer.queue(EnableFocusChange)?;
+    }
+    if mouse_capture {
+        writer.queue(EnableMouseCapture)?;
+        // Crossterm toggles Win32 console mouse input on Windows, but ConPTY
+        // hosts such as VS Code also need the VT tracking modes reasserted.
+        #[cfg(windows)]
+        writer.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")?;
+    }
+    if keyboard_enhanced {
+        write!(writer, "\x1b[={}u", keyboard_enhancement_flags().bits())?;
+    }
+    writer.flush()
+}
+
+pub(crate) fn reapply_configured_terminal_modes() {
+    let policy = crate::perf::tui_policy();
+    if let Err(error) = reapply_terminal_modes_to(
+        &mut std::io::stdout(),
+        policy.enable_mouse_capture,
+        policy.enable_keyboard_enhancement,
+        policy.enable_focus_change,
+    ) {
+        crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod terminal_mode_tests {
+    use super::reapply_terminal_modes_to;
+
+    #[test]
+    fn reapply_omits_mouse_sequences_when_capture_is_disabled() {
+        let mut output = Vec::new();
+        reapply_terminal_modes_to(&mut output, false, true, true).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("\x1b[?2004h\x1b[?1004h"));
+        assert!(!output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[="));
+    }
+
+    #[test]
+    fn reapply_emits_configured_idempotent_modes_without_keyboard_push() {
+        let mut output = Vec::new();
+        reapply_terminal_modes_to(&mut output, true, true, true).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[?2004h"));
+        assert!(output.contains("\x1b[?1004h"));
+        assert!(output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[="), "must set Kitty keyboard flags");
+        assert!(
+            !output.contains("\x1b[>"),
+            "must not push the Kitty keyboard stack"
+        );
+    }
 }
 
 /// Hash a rendered image's transcript anchor into `hasher`. Shared by the
@@ -206,6 +300,14 @@ pub trait TuiState {
     /// is off or the session has no todos.
     fn pinned_todos_payload(&self) -> Option<&str> {
         None
+    }
+    /// Whether the pinned todo band is temporarily expanded to show every row.
+    fn pinned_todos_expanded(&self) -> bool {
+        false
+    }
+    /// Running and recently completed background tasks rendered beneath pinned todos.
+    fn background_task_rows(&self) -> &[BackgroundTaskRow] {
+        &[]
     }
 
     // ---- Input ----
@@ -523,6 +625,10 @@ pub trait TuiState {
     fn diff_pane_scroll_x(&self) -> i32;
     /// Zoom percentage for image widgets rendered inside the side panel.
     fn side_panel_image_zoom_percent(&self) -> u8;
+    /// Image shown in the dismissible full-screen panel preview.
+    fn panel_image_preview(&self) -> Option<u64> {
+        None
+    }
     /// Whether the pinned diff pane is focused
     fn diff_pane_focus(&self) -> bool;
     /// Session-scoped side panel state managed by the side_panel tool
@@ -1210,6 +1316,15 @@ pub enum PickerAction {
     Model,
     Account(AccountPickerAction),
     Login(crate::provider_catalog::LoginProviderDescriptor),
+    /// Native SSH actions never dispatch through laptop-local authentication.
+    RemoteLogin {
+        provider: &'static str,
+        import: bool,
+    },
+    /// Explicit remote import offer/consent, never a local authentication action.
+    RemoteImportDecision {
+        accept: bool,
+    },
     Logout(crate::provider_catalog::LoginProviderDescriptor),
     LogoutAll,
     Usage {
@@ -1226,6 +1341,9 @@ pub enum PickerAction {
     },
     Skill {
         name: String,
+    },
+    SubagentModelChoice {
+        inherit: bool,
     },
 }
 
@@ -1267,9 +1385,12 @@ impl InlineInteractiveState {
 fn estimate_picker_action_bytes(action: &PickerAction) -> usize {
     match action {
         PickerAction::Model
+        | PickerAction::RemoteLogin { .. }
+        | PickerAction::RemoteImportDecision { .. }
         | PickerAction::AgentTarget(_)
         | PickerAction::AgentModelChoice { .. }
         | PickerAction::Skill { .. }
+        | PickerAction::SubagentModelChoice { .. }
         | PickerAction::LogoutAll => 0,
         PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => {
             provider_id.capacity() + label.capacity()
@@ -1525,9 +1646,28 @@ pub struct PickerOption {
     pub estimated_reference_cost_micros: Option<u64>,
 }
 
+/// An SSH-backed socket is not a shared-filesystem local daemon. Keep this
+/// distinct from `App::is_remote`, which also describes ordinary local clients.
+pub(crate) fn ssh_remote_host() -> Option<String> {
+    std::env::var("JCODE_SSH_REMOTE")
+        .ok()
+        .filter(|host| !host.trim().is_empty())
+}
+
+pub(crate) fn is_ssh_remote() -> bool {
+    ssh_remote_host().is_some()
+}
+
 pub(crate) fn subscribe_metadata(
     remote_working_dir: Option<&str>,
 ) -> (Option<String>, Option<bool>) {
+    if is_ssh_remote() {
+        // Never infer a remote project (or self-dev mode) from the laptop cwd.
+        return (
+            remote_working_dir.map(str::to_string),
+            jcode_selfdev_types::client_selfdev_requested().then_some(true),
+        );
+    }
     let working_dir = std::env::current_dir().ok();
     resolve_subscribe_metadata(
         working_dir.as_deref(),
@@ -1899,6 +2039,7 @@ mod tests {
 
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 }

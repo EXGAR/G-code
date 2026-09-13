@@ -6,6 +6,8 @@
 //! of that is visible from a passing `cargo build`, so it is driven here
 //! against a scripted server on a real socket pair.
 
+#![cfg(unix)]
+
 use jcode_harness_api::{
     API_VERSION_MAJOR, ApiEvent, ApiRequest, ClientFrame, ModelRouteInfo, ServerFrame, SessionInfo,
     TextMatch, read_frame, write_frame,
@@ -31,11 +33,17 @@ impl Transport for PairTransport {
 
 fn session(id: &str) -> SessionInfo {
     SessionInfo {
+        parent_session_id: None,
+        agent_label: None,
+        swarm_status: None,
         session_id: id.to_string(),
         working_dir: None,
         title: None,
         status: "idle".to_string(),
         transcript_bytes: None,
+        saved: false,
+        updated_at_ms: None,
+        last_active_at_ms: None,
         archived: false,
         archived_at_ms: None,
     }
@@ -112,6 +120,51 @@ fn the_handshake_reports_the_server_and_its_capabilities() {
     );
 }
 
+#[test]
+fn soft_interrupt_with_images_preserves_attachments_and_legacy_helper() {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&requests);
+    let client = fake_harness(move |frame, writer| {
+        seen.lock()
+            .expect("request log")
+            .push(frame.request.clone());
+        reply(frame, ApiEvent::Ok, writer);
+    });
+
+    client
+        .soft_interrupt_with_images(
+            "s1",
+            "look",
+            vec![("image/png".into(), "aW1hZ2U=".into())],
+            true,
+        )
+        .expect("image interrupt");
+    client
+        .soft_interrupt("s1", "text only", false)
+        .expect("legacy helper");
+
+    let requests = requests.lock().expect("request log");
+    assert!(matches!(
+        &requests[0],
+        ApiRequest::SoftInterrupt {
+            session_id,
+            content,
+            images,
+            urgent: true,
+        } if session_id == "s1"
+            && content == "look"
+            && images == &vec![("image/png".into(), "aW1hZ2U=".into())]
+    ));
+    assert!(matches!(
+        &requests[1],
+        ApiRequest::SoftInterrupt {
+            images,
+            urgent: false,
+            ..
+        } if images.is_empty()
+    ));
+}
+
 /// GA session-management, runtime, credential, and file methods must preserve
 /// the stable protocol shapes while returning ergonomic SDK-owned values.
 #[test]
@@ -120,6 +173,13 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
     let seen = std::sync::Arc::clone(&requests);
     let routes = vec![
         ModelRouteInfo {
+            usage: Some(jcode_sdk::ModelUsage {
+                count: 7,
+                last_used_unix_secs: Some(100),
+                tracking_started_unix_secs: Some(10),
+                selection_count: 3,
+                last_selected_unix_secs: Some(5),
+            }),
             model: "claude".to_string(),
             provider: "anthropic".to_string(),
             api_method: "messages".to_string(),
@@ -127,6 +187,7 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
             detail: "ready".to_string(),
         },
         ModelRouteInfo {
+            usage: None,
             model: "gemini".to_string(),
             provider: "google".to_string(),
             api_method: "generate_content".to_string(),
@@ -142,12 +203,14 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
         let event = match &frame.request {
             ApiRequest::ArchiveSession { .. }
             | ApiRequest::RestoreSession { .. }
-            | ApiRequest::SetRetentionPolicy { .. } => ApiEvent::Ok,
+            | ApiRequest::SetRetentionPolicy { .. }
+            | ApiRequest::NotifyAuthChanged { .. } => ApiEvent::Ok,
             ApiRequest::Ping => ApiEvent::Pong,
             ApiRequest::GetRuntimeInfo { .. } => ApiEvent::RuntimeInfo {
                 session_id: "s1".to_string(),
                 provider: Some("anthropic".to_string()),
                 model: Some("claude".to_string()),
+                reasoning_effort: Some("high".to_string()),
                 routes: reply_routes.clone(),
             },
             ApiRequest::SetApiKey { provider, .. } => ApiEvent::CredentialUpdated {
@@ -210,6 +273,7 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
 
     client.set_api_key("gemini-api", "secret").expect("set key");
     client.clear_api_key("jcode").expect("clear key");
+    client.notify_auth_changed("openai").expect("refresh OAuth");
 
     let content = client
         .read_file("s1", "src/a.rs", Some(5))
@@ -271,6 +335,9 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
             },
             ApiRequest::ClearApiKey {
                 provider: "jcode".to_string(),
+            },
+            ApiRequest::NotifyAuthChanged {
+                provider: "openai".to_string(),
             },
             ApiRequest::ReadFile {
                 session_id: "s1".to_string(),
@@ -490,6 +557,7 @@ fn run_collects_one_turn() {
                     input: 10,
                     output: 5,
                     cache_read_input: Some(2),
+                    cache_creation_input: Some(3),
                 },
                 writer,
             );
@@ -504,7 +572,48 @@ fn run_collects_one_turn() {
     assert_eq!(turn.reasoning, "thinking");
     assert_eq!(turn.tool_calls.len(), 1);
     assert_eq!(turn.tool_calls[0].name, "bash");
-    assert_eq!(turn.usage.expect("usage").input, 10);
+    let usage = turn.usage.expect("usage");
+    assert_eq!(usage.input, 10);
+    assert_eq!(usage.output, 5);
+    assert_eq!(usage.cache_read_input, Some(2));
+    assert_eq!(usage.cache_creation_input, Some(3));
+}
+
+#[test]
+fn run_usage_is_latest_call_and_does_not_retain_previous_cache_counters() {
+    let client = fake_harness(|frame, writer| {
+        if let ApiRequest::SendMessage { session_id, .. } = &frame.request {
+            for (input, cache_read_input, cache_creation_input) in
+                [(10, Some(2), Some(3)), (20, None, None)]
+            {
+                push(
+                    ApiEvent::TokenUsage {
+                        session_id: session_id.clone(),
+                        input,
+                        output: 5,
+                        cache_read_input,
+                        cache_creation_input,
+                    },
+                    writer,
+                );
+            }
+            push(
+                ApiEvent::TurnDone {
+                    session_id: session_id.clone(),
+                },
+                writer,
+            );
+        }
+    });
+    let usage = client
+        .run("s1", "hi", Default::default())
+        .expect("the turn must complete")
+        .usage
+        .expect("usage");
+    assert_eq!(usage.input, 20);
+    assert_eq!(usage.output, 5);
+    assert_eq!(usage.cache_read_input, None);
+    assert_eq!(usage.cache_creation_input, None);
 }
 
 /// An error mid-turn fails `run` rather than hanging: the harness sends `error`
@@ -575,4 +684,144 @@ fn a_lost_connection_fails_requests_in_flight() {
         .ping()
         .expect_err("a dropped harness must fail the request");
     assert_eq!(error.code(), "disconnected");
+}
+
+#[test]
+fn model_switch_preserves_identity_and_catalog_events_around_the_reply() {
+    let client = fake_harness(|frame, writer| {
+        let ApiRequest::SetModel { session_id, model } = &frame.request else {
+            panic!("unexpected request: {:?}", frame.request);
+        };
+        assert_eq!(session_id, "s1");
+        assert_eq!(model, "openai-api:new-model");
+        push(
+            ApiEvent::ConnectionPhase {
+                session_id: session_id.clone(),
+                phase: "connecting".into(),
+            },
+            writer,
+        );
+        // The stream can interleave with a synchronous command in either order.
+        push(
+            ApiEvent::ModelInfo {
+                session_id: session_id.clone(),
+                provider: Some("openai-api".into()),
+                model: Some("new-model".into()),
+                reasoning_effort: None,
+            },
+            writer,
+        );
+        reply(frame, ApiEvent::Ok, writer);
+        push(
+            ApiEvent::RuntimeInfo {
+                session_id: session_id.clone(),
+                provider: Some("openai-api".into()),
+                model: Some("new-model".into()),
+                reasoning_effort: None,
+                routes: vec![ModelRouteInfo {
+                    usage: None,
+                    model: "new-model".into(),
+                    provider: "openai-api".into(),
+                    api_method: "responses".into(),
+                    available: true,
+                    detail: "ready".into(),
+                }],
+            },
+            writer,
+        );
+    });
+    let events = client.events(Some("s1"));
+    let unrelated = client.events(Some("s2"));
+    client
+        .set_model("s1", "openai-api:new-model")
+        .expect("model switch");
+    assert!(matches!(
+        events.next_timeout(Duration::from_secs(1)),
+        Some(ApiEvent::ConnectionPhase { .. })
+    ));
+    assert!(matches!(events.next_timeout(Duration::from_secs(1)),
+        Some(ApiEvent::ModelInfo { model, .. }) if model.as_deref() == Some("new-model")));
+    assert!(matches!(events.next_timeout(Duration::from_secs(1)),
+        Some(ApiEvent::RuntimeInfo { routes, .. }) if routes.len() == 1 && routes[0].available));
+    assert!(unrelated.next_timeout(Duration::from_millis(20)).is_none());
+}
+
+#[test]
+fn model_switch_refusal_is_a_typed_error_not_a_success() {
+    let client = fake_harness(|frame, writer| {
+        assert!(matches!(frame.request, ApiRequest::SetModel { .. }));
+        reply(
+            frame,
+            ApiEvent::Error {
+                code: jcode_harness_api::ErrorCode::InvalidRequest,
+                message: "provider credential is missing".into(),
+            },
+            writer,
+        );
+    });
+    let error = client
+        .set_model("s1", "unavailable-model")
+        .expect_err("switch must fail");
+    assert_eq!(
+        error.kind,
+        jcode_sdk::ErrorKind::Harness(jcode_harness_api::ErrorCode::InvalidRequest)
+    );
+    assert!(error.message.contains("credential"));
+}
+
+#[test]
+fn recovery_events_are_delivered_and_filtered_by_session() {
+    let client = fake_harness(|frame, writer| {
+        if let ApiRequest::Ping = frame.request {
+            reply(frame, ApiEvent::Pong, writer);
+            for session_id in ["other", "mine"] {
+                push(
+                    ApiEvent::SessionRecovery {
+                        session_id: session_id.into(),
+                        continuation_message: "continue task".into(),
+                        reconnect_notice: Some("reconnected".into()),
+                    },
+                    writer,
+                );
+            }
+        }
+    });
+    let stream = client.events(Some("mine"));
+    let all = client.events(None);
+    client.ping().expect("ping");
+    assert_eq!(
+        stream.next_timeout(Duration::from_secs(5)),
+        Some(ApiEvent::SessionRecovery {
+            session_id: "mine".into(),
+            continuation_message: "continue task".into(),
+            reconnect_notice: Some("reconnected".into()),
+        })
+    );
+    for expected in ["other", "mine"] {
+        assert!(
+            matches!(all.next_timeout(Duration::from_secs(5)), Some(ApiEvent::SessionRecovery {session_id, ..}) if session_id == expected)
+        );
+    }
+}
+
+#[test]
+fn send_system_reminder_is_hidden_and_does_not_wait_for_acceptance() {
+    let (sent, received) = channel();
+    let client = fake_harness(move |frame, _writer| {
+        sent.send(frame.request.clone()).unwrap();
+        // Deliberately no reply or message_accepted event.
+    });
+    client
+        .send_system_reminder("mine", "continue task")
+        .unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ApiRequest::SendMessage {
+            session_id: "mine".into(),
+            content: String::new(),
+            system_reminder: Some("continue task".into()),
+            images: vec![],
+            no_reply: false,
+        }
+    );
 }

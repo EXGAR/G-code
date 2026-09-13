@@ -2,16 +2,16 @@ use crate::auth::{AuthState, AuthStatus};
 
 use super::pricing::cheapness_for_route;
 use super::{
-    ALL_OPENAI_MODELS, AccountModelAvailabilityState, CHATGPT_WEB_MODEL, ModelRoute, MultiProvider,
-    Provider, anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
-    build_anthropic_oauth_route, build_chatgpt_web_route, build_copilot_route,
-    build_openai_api_key_route, build_openai_oauth_route, build_openrouter_auto_route,
-    build_openrouter_endpoint_route, build_openrouter_fallback_provider_route,
-    configured_standard_openrouter_profile_routes, copilot, dedupe_model_routes,
-    direct_openai_compatible_profile_routes, format_account_model_availability_detail,
-    is_listable_model_name, known_anthropic_model_ids, known_openai_model_ids,
-    model_availability_for_account, openrouter, openrouter_catalog_model_id, provider_for_model,
-    standard_openrouter_profile_configured,
+    ALL_OPENAI_MODELS, AccountModelAvailabilityState, CHATGPT_WEB_MODEL, GROK_BUILD_PROFILE_ID,
+    ModelRoute, MultiProvider, Provider, ProviderRegistry, anthropic_api_key_route_availability,
+    anthropic_oauth_route_availability, bedrock, build_anthropic_oauth_route,
+    build_chatgpt_web_route, build_copilot_route, build_openai_api_key_route,
+    build_openai_oauth_route, build_openrouter_auto_route, build_openrouter_endpoint_route,
+    build_openrouter_fallback_provider_route, configured_standard_openrouter_profile_routes,
+    copilot, dedupe_model_routes, direct_openai_compatible_profile_routes,
+    format_account_model_availability_detail, is_listable_model_name, known_anthropic_model_ids,
+    known_openai_model_ids, model_availability_for_account, openrouter,
+    openrouter_catalog_model_id, provider_for_model, standard_openrouter_profile_configured,
 };
 
 /// Build the fast local route snapshot used by the TUI model picker while the
@@ -46,6 +46,7 @@ pub fn simplified_model_routes_for_picker(
                     } else {
                         "requires OPENAI_API_KEY".to_string()
                     },
+                    usage: None,
                     cheapness: None,
                 });
                 continue;
@@ -57,6 +58,7 @@ pub fn simplified_model_routes_for_picker(
                     api_method: "openai-oauth".to_string(),
                     available: true,
                     detail: String::new(),
+                    usage: None,
                     cheapness: None,
                 });
             }
@@ -67,6 +69,7 @@ pub fn simplified_model_routes_for_picker(
                     api_method: "openai-api-key".to_string(),
                     available: true,
                     detail: String::new(),
+                    usage: None,
                     cheapness: None,
                 });
             }
@@ -77,6 +80,7 @@ pub fn simplified_model_routes_for_picker(
                     api_method: "openai-oauth".to_string(),
                     available: false,
                     detail: "no credentials".to_string(),
+                    usage: None,
                     cheapness: None,
                 });
             }
@@ -143,6 +147,7 @@ pub fn simplified_model_routes_for_picker(
             api_method,
             available,
             detail,
+            usage: None,
             cheapness: None,
         });
     }
@@ -154,6 +159,7 @@ pub fn simplified_model_routes_for_picker(
             api_method: "current".to_string(),
             available: true,
             detail: "simplified catalog".to_string(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -174,6 +180,7 @@ pub fn append_simplified_anthropic_model_routes(
             api_method: "claude-oauth".to_string(),
             available: true,
             detail: String::new(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -184,6 +191,7 @@ pub fn append_simplified_anthropic_model_routes(
             api_method: "claude-api".to_string(),
             available: true,
             detail: String::new(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -194,6 +202,7 @@ pub fn append_simplified_anthropic_model_routes(
             api_method: "claude-oauth".to_string(),
             available: false,
             detail: "no credentials".to_string(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -222,12 +231,8 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
     let mut routes = Vec::new();
     let mut openrouter_stats = OpenRouterRouteStats::default();
 
-    let has_oauth = provider.has_claude_runtime();
-    let has_api_key = crate::provider_catalog::load_api_key_from_env_or_config(
-        "ANTHROPIC_API_KEY",
-        "anthropic.env",
-    )
-    .is_some();
+    let has_oauth = crate::auth::claude::load_credentials().is_ok();
+    let has_api_key = crate::provider::anthropic::has_anthropic_api_key();
     let openai_auth = crate::auth::AuthStatus::check_fast();
 
     append_anthropic_routes(provider, &mut routes, has_oauth, has_api_key);
@@ -255,6 +260,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
             api_method: "openrouter".to_string(),
             available: false,
             detail: "OPENROUTER_API_KEY not set".to_string(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -285,7 +291,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
     // flooded with hundreds of unusable entries.
     routes.retain(|route| is_listable_model_name(&route.model));
 
-    let routes = dedupe_model_routes(routes);
+    let mut routes = dedupe_model_routes(routes);
 
     // Structured, always-on summary of catalog route building. This is the
     // single most useful line for the recurring "model picker empty / only
@@ -307,6 +313,18 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
         total_ms,
     );
 
+    if let Some(grok) = ProviderRegistry::new(provider).compatible_profile(GROK_BUILD_PROFILE_ID) {
+        for mut route in grok.model_routes() {
+            route.model = format!("grok-build:{}", route.model);
+            route.provider = "Grok Build".to_string();
+            route.api_method = "grok-build-acp".to_string();
+            if !routes.iter().any(|existing| {
+                existing.model == route.model && existing.api_method == route.api_method
+            }) {
+                routes.push(route);
+            }
+        }
+    }
     routes
 }
 
@@ -347,6 +365,7 @@ fn append_anthropic_routes(
                 api_method: "claude-api".to_string(),
                 available: ak_available,
                 detail: ak_detail,
+                usage: None,
                 cheapness: cheapness_for_route(&model, "Anthropic", "claude-api"),
             });
         }
@@ -357,6 +376,7 @@ fn append_anthropic_routes(
                 api_method: "claude-oauth".to_string(),
                 available: false,
                 detail: "no credentials".to_string(),
+                usage: None,
                 cheapness: cheapness_for_route(&model, "Anthropic", "claude-oauth"),
             });
         }
@@ -532,6 +552,7 @@ fn named_provider_profile_routes(
             api_method: api_method.clone(),
             available: true,
             detail: detail.clone(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -569,6 +590,7 @@ fn append_gemini_routes(provider: &MultiProvider, routes: &mut Vec<ModelRoute>) 
                 api_method: "code-assist-oauth".to_string(),
                 available: true,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             });
         }
@@ -590,6 +612,7 @@ fn append_cursor_routes(provider: &MultiProvider, routes: &mut Vec<ModelRoute>) 
                 api_method: "cursor".to_string(),
                 available: true,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             });
         }
@@ -691,6 +714,7 @@ fn append_openrouter_routes(
                 api_method,
                 available: has_openrouter,
                 detail,
+                usage: None,
                 cheapness: None,
             });
         }
@@ -854,6 +878,7 @@ pub fn remote_model_routes_fallback(
                 api_method: crate::subscription_catalog::JCODE_ROUTE_API_METHOD.to_string(),
                 available: true,
                 detail: "jcode subscription routing · managed server-side".to_string(),
+                usage: None,
                 cheapness: None,
             })
             .collect();
@@ -884,6 +909,7 @@ pub fn remote_model_routes_fallback(
                 } else {
                     "no Bedrock credentials or region; run /login bedrock".to_string()
                 },
+                usage: None,
                 cheapness: None,
             });
             continue;
@@ -948,6 +974,7 @@ pub fn remote_model_routes_fallback(
                     api_method: "claude-api".to_string(),
                     available,
                     detail,
+                    usage: None,
                     cheapness: cheapness_for_route(model, "Anthropic", "claude-api"),
                 });
                 added_any = true;
@@ -1039,6 +1066,7 @@ pub fn remote_model_routes_fallback(
                 api_method: "code-assist-oauth".to_string(),
                 available: auth.gemini == AuthState::Available,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             });
             added_any = true;
@@ -1051,6 +1079,7 @@ pub fn remote_model_routes_fallback(
                 api_method: "unknown".to_string(),
                 available: false,
                 detail: "no matching configured provider route".to_string(),
+                usage: None,
                 cheapness: None,
             });
         }
@@ -1088,6 +1117,7 @@ pub fn remote_model_routes_lightweight_fallback(
             } else {
                 "refreshing route details…".to_string()
             },
+            usage: None,
             cheapness: None,
         });
     }
@@ -1099,6 +1129,7 @@ pub fn remote_model_routes_lightweight_fallback(
             api_method: "current".to_string(),
             available: true,
             detail: "refreshing model catalog…".to_string(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -1136,6 +1167,7 @@ pub fn remote_current_openai_compatible_route_for_model(
         api_method: format!("openai-compatible:{}", resolved.id),
         available: true,
         detail: resolved.api_base,
+        usage: None,
         cheapness: None,
     })
 }
@@ -1177,6 +1209,7 @@ pub fn remote_openai_compatible_route_for_model(model: &str) -> Option<ModelRout
             api_method: format!("openai-compatible:{}", resolved.id),
             available: true,
             detail,
+            usage: None,
             cheapness: None,
         });
     }
@@ -1221,6 +1254,7 @@ fn named_provider_profile_route_for_model_in(
             api_method: format!("openai-compatible:{}", profile_name),
             available: true,
             detail,
+            usage: None,
             cheapness: None,
         });
     }
@@ -1364,6 +1398,33 @@ mod tests {
             route.api_method_kind(),
             jcode_provider_core::ModelRouteApiMethod::OpenAiCompatible { .. }
         ));
+    }
+
+    #[test]
+    fn named_anthropic_profile_preserves_profile_identity_in_picker_switch() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "corp-claude".to_string(),
+            crate::config::NamedProviderConfig {
+                provider_type: crate::config::NamedProviderType::AnthropicCompatible,
+                base_url: "https://gateway.example/anthropic/v1".to_string(),
+                default_model: Some("claude-custom".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let route = named_provider_profile_route_for_model_in("claude-custom", &providers)
+            .expect("Anthropic-compatible model must resolve to its profile");
+        assert_eq!(route.provider, "corp-claude");
+        assert_eq!(route.api_method, "openai-compatible:corp-claude");
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                &route.model,
+                Some(&route.provider),
+                Some(&route.api_method),
+            ),
+            "corp-claude:claude-custom"
+        );
     }
 
     #[test]

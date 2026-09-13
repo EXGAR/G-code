@@ -42,6 +42,7 @@ fn hostile_schema() -> Value {
 
 fn hostile_tool() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
+        execution_mode: None,
         name: "mcp__hostile__probe".to_string(),
         description: "probe".to_string(),
         input_schema: hostile_schema(),
@@ -235,6 +236,7 @@ fn provider_request_builders_that_reach_the_dialect_engine_are_pinned() {
 #[test]
 fn anthropic_sends_a_schema_without_a_top_level_combiner() {
     let combiner_tool = vec![ToolDefinition {
+        execution_mode: None,
         name: "multi_action".to_string(),
         description: "probe".to_string(),
         input_schema: serde_json::json!({
@@ -278,6 +280,7 @@ fn anthropic_sends_a_schema_without_a_top_level_combiner() {
 
     // And a no-argument tool still gets the object shape Anthropic requires.
     let bare = vec![ToolDefinition {
+        execution_mode: None,
         name: "noargs".to_string(),
         description: "probe".to_string(),
         input_schema: serde_json::json!({}),
@@ -304,6 +307,7 @@ fn anthropic_sends_a_schema_without_a_top_level_combiner() {
 #[test]
 fn a_keyword_no_deny_list_has_ever_heard_of_reaches_no_provider() {
     let novel = vec![ToolDefinition {
+        execution_mode: None,
         name: "mcp__future__probe".to_string(),
         description: "probe".to_string(),
         input_schema: serde_json::json!({

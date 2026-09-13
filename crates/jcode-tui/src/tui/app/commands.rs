@@ -113,6 +113,7 @@ pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.last_todo_ownership_fingerprint = None;
     app.todo_gate_digest_delivered = false;
     cleared
 }
@@ -245,6 +246,7 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.last_todo_ownership_fingerprint = None;
     // Re-arming starts a fresh review cycle, so the deferred quality digest is
     // eligible to be delivered again for the upcoming work.
     app.todo_gate_digest_delivered = false;
@@ -1353,8 +1355,18 @@ fn handle_fork_command(app: &mut App, trimmed: &str) -> bool {
 /// as the first message of the forked session. Shared by `/btw <question>`,
 /// `/fork [prompt]`, and `/split`.
 pub(super) fn fork_session_with_prompt_local(app: &mut App, prompt: Option<&str>) {
-    let staged = prompt.map(|prompt| (prompt.to_string(), Vec::new()));
+    // Images attached to the input belong to the prompt being forked off, so
+    // they travel with it instead of lingering on the parent's next message.
+    let images = if prompt.is_some() {
+        std::mem::take(&mut app.pending_images)
+    } else {
+        Vec::new()
+    };
+    let staged = prompt.map(|prompt| (prompt.to_string(), images.clone()));
     if let Err(error) = launch_forked_session_local(app, staged) {
+        if !images.is_empty() {
+            app.pending_images = images;
+        }
         app.push_display_message(DisplayMessage::error(format!(
             "Failed to fork session: {}",
             error
@@ -2186,9 +2198,12 @@ pub(super) fn build_fast_macos_release_prompt() -> String {
 }
 
 pub(super) fn build_remote_release_prompt() -> String {
-    build_release_prompt(
+    let jcode_release = build_release_prompt(
         "",
         "Then run scripts/quick-release.sh --remote v<version> to push the tag immediately without any local build. Let the release workflow build, sign, checksum, and publish every platform, and leave publication gated on those remote checks.",
+    );
+    format!(
+        "First identify the repository in the current working directory from its git remote, release documentation, package manifests, existing tags, and CI workflows. Only use the following Jcode-specific procedure when this is the Jcode self-development repository and scripts/quick-release.sh exists: {jcode_release} Otherwise, use the repository's own established release conventions. Inspect its release documentation, workflows, scripts, manifests, tag format, and recent releases before changing anything. Make logical commits for current work without disturbing unrelated changes and push them normally. Determine the next version from this repository's versioning scheme and user-visible changes, update only the version files and changelog formats it actually uses, validate the metadata, commit and push it, then trigger the repository's documented remote release mechanism. Prefer a tag-triggered or workflow-dispatch CI release that performs builds and publication remotely. Do not assume the project uses Cargo, changelog JSON, v-prefixed tags, or scripts/quick-release.sh. Do not build release artifacts locally unless this repository explicitly requires it and no remote release path exists. Never force-push, move an existing tag, bypass remote release gates, or invent a release process. Report the detected release convention, version, commits, tag or workflow invocation, and remote release status."
     )
 }
 
@@ -3024,7 +3039,7 @@ pub(super) fn handle_swarm_prompt_command(app: &mut App, trimmed: &str) -> bool 
     match run_interactive_editor(&mut command) {
         Ok(status) if status.success() => {
             app.push_display_message(DisplayMessage::system(format!(
-                "Edited the active swarm routing prompt in {}:\n{}\n\nChanges apply after restarting or reloading Jcode because running agent tool registries cache the prompt.",
+                "Edited the active swarm routing prompt in {}:\n{}\n\nNew agents will use this prompt immediately. Existing agents retain their current prompt to preserve their context cache.",
                 editor,
                 path.display()
             )));

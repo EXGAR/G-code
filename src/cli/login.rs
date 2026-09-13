@@ -25,6 +25,8 @@ pub struct LoginOptions {
     pub auth_code: Option<String>,
     pub json: bool,
     pub complete: bool,
+    pub flow_id: Option<String>,
+    pub cancel: bool,
     pub no_validate: bool,
     pub google_access_tier: Option<auth::google::GmailAccessTier>,
     pub openai_compatible_api_base: Option<String>,
@@ -34,6 +36,20 @@ pub struct LoginOptions {
 }
 
 impl LoginOptions {
+    fn validate(&self) -> Result<()> {
+        if let Some(flow_id) = &self.flow_id {
+            parse_login_flow_id(flow_id).map_err(anyhow::Error::msg)?;
+        }
+        if self.cancel {
+            anyhow::ensure!(self.flow_id.is_some(), "--cancel requires --flow-id.");
+            anyhow::ensure!(
+                !self.print_auth_url && !self.complete && !self.has_provided_input(),
+                "--cancel cannot be combined with login begin or completion flags."
+            );
+        }
+        Ok(())
+    }
+
     fn has_provided_input(&self) -> bool {
         self.callback_url.is_some() || self.auth_code.is_some()
     }
@@ -54,8 +70,26 @@ impl LoginOptions {
     }
 
     fn uses_scriptable_flow(&self) -> Result<bool> {
-        Ok(self.print_auth_url || self.complete || self.has_provided_input())
+        Ok(self.print_auth_url
+            || self.complete
+            || self.has_provided_input()
+            || self.flow_id.is_some()
+            || self.cancel)
     }
+}
+
+pub(crate) fn parse_login_flow_id(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(
+            "--flow-id must contain 1-64 ASCII letters, digits, underscores or hyphens.".into(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -125,8 +159,8 @@ impl PendingScriptableLogin {
         }
     }
 
-    fn pending_path(&self) -> Result<PathBuf> {
-        pending_login_path(self.key())
+    fn pending_path(&self, flow_id: Option<&str>) -> Result<PathBuf> {
+        pending_login_path(self.key(), flow_id)
     }
 
     fn default_expires_at_ms(&self) -> i64 {
@@ -161,6 +195,7 @@ pub async fn run_login(
     account_label: Option<&str>,
     options: LoginOptions,
 ) -> Result<()> {
+    options.validate()?;
     if let Some(provider) = login_provider_for_choice(choice) {
         if matches!(choice, ProviderChoice::ClaudeSubprocess) {
             eprintln!(
@@ -210,6 +245,10 @@ pub async fn run_login_provider(
     account_label: Option<&str>,
     options: LoginOptions,
 ) -> Result<()> {
+    options.validate()?;
+    if options.cancel {
+        return cancel_scriptable_login(provider, &options);
+    }
     crate::telemetry::record_provider_selected(provider.id);
     crate::telemetry::record_auth_started(provider.id, provider.auth_kind.label());
     let explicit_scriptable_flow = options.uses_scriptable_flow()?;
@@ -295,6 +334,9 @@ pub async fn run_login_provider(
             LoginProviderTarget::OpenAiApiKey => {
                 login_openai_api_key_flow().map(|_| LoginFlowOutcome::Completed)
             }
+            LoginProviderTarget::GrokBuild => login_grok_build_flow()
+                .await
+                .map(|_| LoginFlowOutcome::Completed),
             LoginProviderTarget::OpenRouter => {
                 login_openrouter_flow().map(|_| LoginFlowOutcome::Completed)
             }
@@ -400,6 +442,28 @@ pub async fn run_login_provider(
     );
     maybe_persist_default_provider_after_login(provider, &options);
     notify_running_server_auth_changed_best_effort(Some(provider.id)).await;
+    Ok(())
+}
+
+async fn login_grok_build_flow() -> Result<()> {
+    eprintln!("Preparing the Jcode-managed Grok Build backend...");
+    let cli = crate::auth::grok_build::ensure_cli().await?;
+    let status = tokio::process::Command::new(&cli)
+        .arg("login")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to launch Jcode's managed Grok Build backend at '{}'",
+                cli.display()
+            )
+        })?;
+    if !status.success() {
+        anyhow::bail!("`{} login` exited with status {status}", cli.display());
+    }
     Ok(())
 }
 
@@ -1142,6 +1206,7 @@ async fn login_copilot_device_flow(no_browser: bool) -> Result<()> {
         &device_resp.verification_uri,
         "  Or scan this QR on another device to open the verification page:",
         "    ",
+        crate::auth::browser_suppressed(no_browser),
     ) {
         eprintln!("{qr}");
         eprintln!();
